@@ -56,7 +56,7 @@ const (
 	// qslotMapMin is the lower bound for indexing queue groups during a Match.
 	qslotMapMin = 64
 	// qslotMapPoolMax is the largest queue-group map retained for reuse.
-	qslotMapPoolMax = 256
+	qslotMapPoolMax = 512
 )
 
 // SublistResult is a result structure better optimized for queue subs.
@@ -745,7 +745,7 @@ func addNodeToResults(n *node, results *SublistResult, qslots *map[string]int) {
 		slots := qslotMapPool.Get().(map[string]int)
 		for i, qr := range results.qsubs {
 			if len(qr) > 0 {
-				slots[string(qr[0].queue)] = i
+				slots[bytesToString(qr[0].queue)] = i
 			}
 		}
 		*qslots = slots
