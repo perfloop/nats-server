@@ -56,8 +56,9 @@ func NewSimpleSublist() *SimpleSublist {
 // A GenericSublist stores and efficiently retrieves subscriptions.
 type GenericSublist[T comparable] struct {
 	sync.RWMutex
-	root  *level[T]
-	count uint32
+	root      *level[T]
+	count     uint32
+	wildcards uint32
 }
 
 // A node contains subscriptions and a pointer to the next level.
@@ -92,7 +93,7 @@ func NewSublist[T comparable]() *GenericSublist[T] {
 func (s *GenericSublist[T]) Insert(subject string, value T) error {
 	s.Lock()
 
-	var sfwc bool
+	var sfwc, hasWildcard bool
 	var n *node[T]
 	l := s.root
 
@@ -109,9 +110,10 @@ func (s *GenericSublist[T]) Insert(subject string, value T) error {
 			switch t[0] {
 			case pwc:
 				n = l.pwc
+				hasWildcard = true
 			case fwc:
 				n = l.fwc
-				sfwc = true
+				sfwc, hasWildcard = true, true
 			default:
 				n = l.nodes[t]
 			}
@@ -140,6 +142,9 @@ func (s *GenericSublist[T]) Insert(subject string, value T) error {
 	n.subs[value] = subject
 
 	s.count++
+	if hasWildcard {
+		s.wildcards++
+	}
 	s.Unlock()
 
 	return nil
@@ -161,6 +166,16 @@ func (s *GenericSublist[T]) MatchBytes(subject []byte, cb func(T)) {
 // In cases where more detail is not required, this may be faster than Match.
 func (s *GenericSublist[T]) HasInterest(subject string) bool {
 	return s.hasInterest(subject, true, nil)
+}
+
+// FilterInfo returns metadata for the current filter set.
+func (s *GenericSublist[T]) FilterInfo() (count uint32, hasWildcard, hasFullWildcard bool) {
+	if s == nil {
+		return 0, false, false
+	}
+	s.RLock()
+	defer s.RUnlock()
+	return s.count, s.wildcards > 0, s.root.fwc != nil
 }
 
 // NumInterest will return the number of subs interested in the subject.
@@ -371,7 +386,7 @@ func (s *GenericSublist[T]) remove(subject string, value T, shouldLock bool) err
 		defer s.Unlock()
 	}
 
-	var sfwc bool
+	var sfwc, hasWildcard bool
 	var n *node[T]
 	l := s.root
 
@@ -393,9 +408,10 @@ func (s *GenericSublist[T]) remove(subject string, value T, shouldLock bool) err
 			switch t[0] {
 			case pwc:
 				n = l.pwc
+				hasWildcard = true
 			case fwc:
 				n = l.fwc
-				sfwc = true
+				sfwc, hasWildcard = true, true
 			default:
 				n = l.nodes[t]
 			}
@@ -413,6 +429,9 @@ func (s *GenericSublist[T]) remove(subject string, value T, shouldLock bool) err
 	}
 
 	s.count--
+	if hasWildcard {
+		s.wildcards--
+	}
 
 	for i := len(levels) - 1; i >= 0; i-- {
 		l, n, t := levels[i].l, levels[i].n, levels[i].t

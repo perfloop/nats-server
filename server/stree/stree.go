@@ -486,11 +486,17 @@ func LazyIntersect[TL, TR any](tl *SubjectTree[TL], tr *SubjectTree[TR], cb func
 // have interest expressed in the given sublist. The callback will only be called
 // once for each subject, regardless of overlapping subscriptions in the sublist.
 func IntersectGSL[T any, SL comparable](t *SubjectTree[T], sl *gsl.GenericSublist[SL], cb func(subject []byte, val *T) bool) {
+	var _pre [256]byte
+	IntersectGSLWithScratch(t, sl, _pre[:0], cb)
+}
+
+// IntersectGSLWithScratch is IntersectGSL using scratch to build subject paths.
+// The callback must not retain or modify its subject argument.
+func IntersectGSLWithScratch[T any, SL comparable](t *SubjectTree[T], sl *gsl.GenericSublist[SL], scratch []byte, cb func(subject []byte, val *T) bool) {
 	if t == nil || t.root == nil || sl == nil {
 		return
 	}
-	var _pre [256]byte
-	_intersectGSL(t.root, _pre[:0], sl, cb)
+	_intersectGSL(t.root, scratch[:0], sl, cb)
 }
 
 func _intersectGSL[T any, SL comparable](n node, pre []byte, sl *gsl.GenericSublist[SL], cb func(subject []byte, val *T) bool) bool {

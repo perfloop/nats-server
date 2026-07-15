@@ -34,6 +34,40 @@ func TestGenericSublistInsertCount(t *testing.T) {
 	require_Equal(t, s.Count(), 3)
 }
 
+func TestGenericSublistFilterInfo(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		filters         []string
+		hasWildcard     bool
+		hasFullWildcard bool
+	}{
+		{name: "literals", filters: []string{"orders.eu", "orders.us"}},
+		{name: "partial", filters: []string{"orders.*"}, hasWildcard: true},
+		{name: "suffix_full", filters: []string{"events.>"}, hasWildcard: true},
+		{name: "root_full", filters: []string{">"}, hasWildcard: true, hasFullWildcard: true},
+		{name: "mixed", filters: []string{"orders.eu", "events.*"}, hasWildcard: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewSimpleSublist()
+			for _, filter := range tc.filters {
+				require_NoError(t, s.Insert(filter, struct{}{}))
+			}
+			count, hasWildcard, hasFullWildcard := s.FilterInfo()
+			require_Equal(t, count, uint32(len(tc.filters)))
+			require_Equal(t, hasWildcard, tc.hasWildcard)
+			require_Equal(t, hasFullWildcard, tc.hasFullWildcard)
+		})
+	}
+
+	s := NewSimpleSublist()
+	require_NoError(t, s.Insert("orders.*", struct{}{}))
+	require_NoError(t, s.Remove("orders.*", struct{}{}))
+	count, hasWildcard, hasFullWildcard := s.FilterInfo()
+	require_Equal(t, count, uint32(0))
+	require_False(t, hasWildcard)
+	require_False(t, hasFullWildcard)
+}
+
 func TestGenericSublistSimple(t *testing.T) {
 	s := NewSublist[struct{}]()
 	require_NoError(t, s.Insert("foo", struct{}{}))

@@ -49,6 +49,7 @@ type memStore struct {
 	ttls        *thw.HashWheel
 	scheduling  *MsgScheduling
 	sdm         *SDMMeta
+	fssScratch  []byte // Reused subject path storage for indexed multi-filter scans.
 }
 
 func newMemStore(cfg *StreamConfig) (*memStore, error) {
@@ -1809,22 +1810,74 @@ func (ms *memStore) loadLastLocked(subject string, smp *StoreMsg) (*StoreMsg, er
 
 // LoadNextMsgMulti will find the next message matching any entry in the sublist.
 func (ms *memStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *StoreMsg) (sm *StoreMsg, skip uint64, err error) {
-	// TODO(dlc) - for now simple linear walk to get started.
+	if sl == nil {
+		return ms.LoadNextMsg(_EMPTY_, false, start, smp)
+	}
+	filterCount, hasWildcard, hasFullWildcard := sl.FilterInfo()
+	if hasFullWildcard {
+		return ms.LoadNextMsg(_EMPTY_, false, start, smp)
+	}
+	if filterCount == 1 {
+		if filter, ok := sl.MatchesSingleFilter(); ok {
+			return ms.LoadNextMsg(filter, subjectHasWildcard(filter), start, smp)
+		}
+	}
+
 	ms.mu.RLock()
-	defer ms.mu.RUnlock()
+	if start < ms.state.FirstSeq {
+		start = ms.state.FirstSeq
+	}
+	if start > ms.state.LastSeq || ms.state.Msgs == 0 {
+		ms.mu.RUnlock()
+		return nil, ms.state.LastSeq, ErrStoreEOF
+	}
+	if ms.shouldLinearScanMulti(hasWildcard, start) {
+		sm, skip, err = ms.loadNextMsgMultiLocked(sl, start, ms.state.LastSeq, smp)
+		ms.mu.RUnlock()
+		return sm, skip, err
+	}
+	ms.mu.RUnlock()
+
+	// Recalculate per-subject bounds under the write lock before using them to
+	// narrow the scan range.
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 
 	if start < ms.state.FirstSeq {
 		start = ms.state.FirstSeq
 	}
-
-	// If past the end no results.
 	if start > ms.state.LastSeq || ms.state.Msgs == 0 {
 		return nil, ms.state.LastSeq, ErrStoreEOF
 	}
 
-	// Initial setup.
-	fseq, lseq := start, ms.state.LastSeq
+	fseq, lseq, found := ms.state.LastSeq, uint64(0), false
+	if ms.fssScratch == nil {
+		ms.fssScratch = make([]byte, 0, 256)
+	}
+	stree.IntersectGSLWithScratch(ms.fss, sl, ms.fssScratch, func(subj []byte, ss *SimpleState) bool {
+		if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
+			ms.recalculateForSubj(bytesToString(subj), ss)
+		}
+		if start > ss.Last {
+			return true
+		}
+		found = true
+		if ss.First < fseq {
+			fseq = ss.First
+		}
+		if ss.Last > lseq {
+			lseq = ss.Last
+		}
+		return true
+	})
+	if !found {
+		return nil, ms.state.LastSeq, ErrStoreEOF
+	}
+	return ms.loadNextMsgMultiLocked(sl, max(fseq, start), lseq, smp)
+}
 
+// Lock should be held.
+func (ms *memStore) loadNextMsgMultiLocked(sl *gsl.SimpleSublist, fseq, lseq uint64, smp *StoreMsg) (*StoreMsg, uint64, error) {
 	for nseq := fseq; nseq <= lseq; nseq++ {
 		sm, ok := ms.msgs[nseq]
 		if !ok {
@@ -1919,6 +1972,14 @@ func (ms *memStore) shouldLinearScan(filter string, wc bool, start uint64) bool 
 	const linearScanMaxFSS = 256
 	isAll := filter == fwcs
 	return isAll || 2*int(ms.state.LastSeq-start) < ms.fss.Size() || (wc && ms.fss.Size() > linearScanMaxFSS)
+}
+
+// Lock should be held.
+func (ms *memStore) shouldLinearScanMulti(hasWildcard bool, start uint64) bool {
+	// For broad wildcard interest, traversing a large subject tree is more
+	// expensive than checking the bounded sequence range directly.
+	const linearScanMaxFSS = 256
+	return 2*int(ms.state.LastSeq-start) < ms.fss.Size() || (hasWildcard && ms.fss.Size() > linearScanMaxFSS)
 }
 
 // Lock should be held.
