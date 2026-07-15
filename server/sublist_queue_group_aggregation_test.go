@@ -205,7 +205,6 @@ func BenchmarkSublistQueueGroupAggregation(b *testing.B) {
 		{1, 3},
 		{4, 3},
 		{8, 3},
-		{16, 3},
 		{64, 3},
 		{256, 3},
 	}
