@@ -55,6 +55,8 @@ const (
 	plistMin = 256
 	// qslotMapMin is the lower bound for indexing queue groups during a Match.
 	qslotMapMin = 64
+	// qslotMapPoolMax is the largest queue-group map retained for reuse.
+	qslotMapPoolMax = 256
 )
 
 // SublistResult is a result structure better optimized for queue subs.
@@ -615,7 +617,7 @@ func (s *Sublist) match(subject string, doLock bool, doCopyOnCache bool) *Sublis
 
 	var qslots map[string]int
 	matchLevel(s.root, tokens, result, &qslots)
-	if qslots != nil {
+	if qslots != nil && len(qslots) <= qslotMapPoolMax {
 		clear(qslots)
 		qslotMapPool.Put(qslots)
 	}

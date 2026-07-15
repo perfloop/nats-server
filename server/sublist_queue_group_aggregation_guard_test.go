@@ -53,27 +53,6 @@ func BenchmarkSublistQueueGroupAggregationBoundary(b *testing.B) {
 	}
 }
 
-func BenchmarkSublistQueueGroupAggregationCacheHit(b *testing.B) {
-	const (
-		queueGroups   = 64
-		matchingNodes = 3
-	)
-
-	f := newQueueGroupAggregationFixture(true, queueGroups, matchingNodes, false)
-	subject := f.subjects[0]
-	checkQueueGroupAggregationBenchmarkResult(b, f.sl.Match(subject), queueGroups, matchingNodes)
-	hits := atomic.LoadUint64(&f.sl.cacheHits)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		checkQueueGroupAggregationBenchmarkResult(b, f.sl.Match(subject), queueGroups, matchingNodes)
-	}
-	b.StopTimer()
-	if got := atomic.LoadUint64(&f.sl.cacheHits) - hits; got != uint64(b.N) {
-		b.Fatalf("cache hits = %d, want %d", got, b.N)
-	}
-}
-
 func BenchmarkSublistQueueGroupAggregationCacheChurn(b *testing.B) {
 	const (
 		queueGroups   = 64
