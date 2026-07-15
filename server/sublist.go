@@ -53,6 +53,8 @@ const (
 	slCacheSweep = 256
 	// plistMin is our lower bounds to create a fast plist for Match.
 	plistMin = 256
+	// qslotMapMin is the lower bound for indexing queue groups during a Match.
+	qslotMapMin = 64
 )
 
 // SublistResult is a result structure better optimized for queue subs.
@@ -527,6 +529,12 @@ func (s *Sublist) removeFromCache(subject string) {
 // a place holder for an empty result.
 var emptyResult = &SublistResult{}
 
+var qslotMapPool = sync.Pool{
+	New: func() any {
+		return make(map[string]int, qslotMapMin)
+	},
+}
+
 // Match will match all entries to the literal subject.
 // It will return a set of results for both normal and queue subscribers.
 func (s *Sublist) Match(subject string) *SublistResult {
@@ -605,7 +613,12 @@ func (s *Sublist) match(subject string, doLock bool, doCopyOnCache bool) *Sublis
 		}
 	}
 
-	matchLevel(s.root, tokens, result)
+	var qslots map[string]int
+	matchLevel(s.root, tokens, result, &qslots)
+	if qslots != nil {
+		clear(qslots)
+		qslotMapPool.Put(qslots)
+	}
 	// Check for empty result.
 	if len(result.psubs) == 0 && len(result.qsubs) == 0 {
 		result = emptyResult
@@ -716,7 +729,7 @@ func (s *Sublist) UpdateRemoteQSub(sub *subscription) {
 }
 
 // This will add in a node's results to the total results.
-func addNodeToResults(n *node, results *SublistResult) {
+func addNodeToResults(n *node, results *SublistResult, qslots *map[string]int) {
 	// Normal subscriptions
 	if n.plist != nil {
 		results.psubs = append(results.psubs, n.plist...)
@@ -726,13 +739,30 @@ func addNodeToResults(n *node, results *SublistResult) {
 		}
 	}
 	// Queue subscriptions
+	if qslots != nil && *qslots == nil && (len(results.qsubs) >= qslotMapMin || len(n.qsubs) >= qslotMapMin) {
+		slots := qslotMapPool.Get().(map[string]int)
+		for i, qr := range results.qsubs {
+			if len(qr) > 0 {
+				slots[string(qr[0].queue)] = i
+			}
+		}
+		*qslots = slots
+	}
 	for qname, qr := range n.qsubs {
 		if len(qr) == 0 {
 			continue
 		}
 		// Need to find matching list in results
 		var i int
-		if i = findQSlot([]byte(qname), results.qsubs); i < 0 {
+		if qslots != nil && *qslots != nil {
+			var ok bool
+			if i, ok = (*qslots)[qname]; !ok {
+				i = len(results.qsubs)
+				nqsub := make([]*subscription, 0, len(qr))
+				results.qsubs = append(results.qsubs, nqsub)
+				(*qslots)[qname] = i
+			}
+		} else if i = findQSlot([]byte(qname), results.qsubs); i < 0 {
 			i = len(results.qsubs)
 			nqsub := make([]*subscription, 0, len(qr))
 			results.qsubs = append(results.qsubs, nqsub)
@@ -768,17 +798,17 @@ func findQSlot(queue []byte, qsl [][]*subscription) int {
 }
 
 // matchLevel is used to recursively descend into the trie.
-func matchLevel(l *level, toks []string, results *SublistResult) {
+func matchLevel(l *level, toks []string, results *SublistResult, qslots *map[string]int) {
 	var pwc, n *node
 	for i, t := range toks {
 		if l == nil {
 			return
 		}
 		if l.fwc != nil {
-			addNodeToResults(l.fwc, results)
+			addNodeToResults(l.fwc, results, qslots)
 		}
 		if pwc = l.pwc; pwc != nil {
-			matchLevel(pwc.next, toks[i+1:], results)
+			matchLevel(pwc.next, toks[i+1:], results, qslots)
 		}
 		n = l.nodes[t]
 		if n != nil {
@@ -788,10 +818,10 @@ func matchLevel(l *level, toks []string, results *SublistResult) {
 		}
 	}
 	if n != nil {
-		addNodeToResults(n, results)
+		addNodeToResults(n, results, qslots)
 	}
 	if pwc != nil {
-		addNodeToResults(pwc, results)
+		addNodeToResults(pwc, results, qslots)
 	}
 }
 
@@ -1721,7 +1751,7 @@ func reverseMatchLevel(l *level, toks []string, n *node, results *SublistResult)
 		l = n.next
 	}
 	if n != nil {
-		addNodeToResults(n, results)
+		addNodeToResults(n, results, nil)
 	}
 }
 
@@ -1730,13 +1760,13 @@ func getAllNodes(l *level, results *SublistResult) {
 		return
 	}
 	if l.pwc != nil {
-		addNodeToResults(l.pwc, results)
+		addNodeToResults(l.pwc, results, nil)
 	}
 	if l.fwc != nil {
-		addNodeToResults(l.fwc, results)
+		addNodeToResults(l.fwc, results, nil)
 	}
 	for _, n := range l.nodes {
-		addNodeToResults(n, results)
+		addNodeToResults(n, results, nil)
 		getAllNodes(n.next, results)
 	}
 }
