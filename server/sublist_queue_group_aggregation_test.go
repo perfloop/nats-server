@@ -238,30 +238,3 @@ func TestSublistQueueGroupAggregationAcrossMatchedNodes(t *testing.T) {
 		}
 	})
 }
-
-func BenchmarkSublistQueueGroupAggregation(b *testing.B) {
-	cases := []struct {
-		queueGroups   int
-		matchingNodes int
-	}{
-		{1, 3},
-		{4, 3},
-		{8, 3},
-		{64, 3},
-		{256, 3},
-	}
-
-	for _, tc := range cases {
-		b.Run(fmt.Sprintf("groups=%d/nodes=%d", tc.queueGroups, tc.matchingNodes), func(b *testing.B) {
-			f := newQueueGroupAggregationFixture(false, tc.queueGroups, tc.matchingNodes, false)
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				r := f.sl.Match(f.subjects[i%len(f.subjects)])
-				if len(r.qsubs) != tc.queueGroups || len(r.qsubs[0]) != tc.matchingNodes {
-					b.Fatalf("unexpected result shape: %d queue groups, %d subscriptions in first group", len(r.qsubs), len(r.qsubs[0]))
-				}
-			}
-		})
-	}
-}

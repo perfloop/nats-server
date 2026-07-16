@@ -754,7 +754,7 @@ func (s *Sublist) UpdateRemoteQSub(sub *subscription) {
 }
 
 // This will add in a node's results to the total results.
-func addNodeToResults(n *node, results *SublistResult, qslots *map[string]int) {
+func addNodeToResults(n *node, results *SublistResult) {
 	// Normal subscriptions
 	if n.plist != nil {
 		results.psubs = append(results.psubs, n.plist...)
@@ -764,7 +764,41 @@ func addNodeToResults(n *node, results *SublistResult, qslots *map[string]int) {
 		}
 	}
 	// Queue subscriptions
-	if qslots != nil && *qslots == nil && len(results.qsubs) <= qslotMapPoolMax && len(n.qsubs) <= qslotMapPoolMax && (len(results.qsubs) >= qslotMapMin || len(n.qsubs) >= qslotMapMin) {
+	for qname, qr := range n.qsubs {
+		if len(qr) == 0 {
+			continue
+		}
+		// Need to find matching list in results
+		var i int
+		if i = findQSlot([]byte(qname), results.qsubs); i < 0 {
+			i = len(results.qsubs)
+			nqsub := make([]*subscription, 0, len(qr))
+			results.qsubs = append(results.qsubs, nqsub)
+		}
+		for sub := range qr {
+			if isRemoteQSub(sub) {
+				ns := atomic.LoadInt32(&sub.qw)
+				// Shadow these subscriptions
+				for n := 0; n < int(ns); n++ {
+					results.qsubs[i] = append(results.qsubs[i], sub)
+				}
+			} else {
+				results.qsubs[i] = append(results.qsubs[i], sub)
+			}
+		}
+	}
+}
+
+// Keep the linear aggregation path separate so below-threshold matches do not
+// pay for indexing.
+func shouldUseQSlots(qslots map[string]int, n *node, results *SublistResult) bool {
+	return qslots != nil ||
+		((len(results.qsubs) >= qslotMapMin || len(n.qsubs) >= qslotMapMin) &&
+			len(results.qsubs) <= qslotMapPoolMax && len(n.qsubs) <= qslotMapPoolMax)
+}
+
+func addNodeToResultsWithQSlots(n *node, results *SublistResult, qslots *map[string]int) {
+	if *qslots == nil {
 		slots := qslotMapPool.get()
 		for i, qr := range results.qsubs {
 			if len(qr) > 0 {
@@ -773,24 +807,35 @@ func addNodeToResults(n *node, results *SublistResult, qslots *map[string]int) {
 		}
 		*qslots = slots
 	}
+
+	// Normal subscriptions
+	if n.plist != nil {
+		results.psubs = append(results.psubs, n.plist...)
+	} else {
+		for psub := range n.psubs {
+			results.psubs = append(results.psubs, psub)
+		}
+	}
+	// Queue subscriptions
+	slots := *qslots
+	indexed := true
 	for qname, qr := range n.qsubs {
 		if len(qr) == 0 {
 			continue
 		}
-		// Need to find matching list in results
+		// Need to find matching list in results.
 		var i int
-		indexed := qslots != nil && *qslots != nil
 		if indexed {
 			var ok bool
-			if i, ok = (*qslots)[qname]; !ok {
+			if i, ok = slots[qname]; !ok {
 				if len(results.qsubs) < qslotMapPoolMax {
 					i = len(results.qsubs)
 					nqsub := make([]*subscription, 0, len(qr))
 					results.qsubs = append(results.qsubs, nqsub)
-					(*qslots)[qname] = i
+					slots[qname] = i
 				} else {
 					// Do not grow an index that exceeds the retained-map bound.
-					qslotMapPool.put(*qslots)
+					qslotMapPool.put(slots)
 					*qslots = nil
 					indexed = false
 				}
@@ -841,7 +886,11 @@ func matchLevel(l *level, toks []string, results *SublistResult, qslots *map[str
 			return
 		}
 		if l.fwc != nil {
-			addNodeToResults(l.fwc, results, qslots)
+			if shouldUseQSlots(*qslots, l.fwc, results) {
+				addNodeToResultsWithQSlots(l.fwc, results, qslots)
+			} else {
+				addNodeToResults(l.fwc, results)
+			}
 		}
 		if pwc = l.pwc; pwc != nil {
 			matchLevel(pwc.next, toks[i+1:], results, qslots)
@@ -854,10 +903,18 @@ func matchLevel(l *level, toks []string, results *SublistResult, qslots *map[str
 		}
 	}
 	if n != nil {
-		addNodeToResults(n, results, qslots)
+		if shouldUseQSlots(*qslots, n, results) {
+			addNodeToResultsWithQSlots(n, results, qslots)
+		} else {
+			addNodeToResults(n, results)
+		}
 	}
 	if pwc != nil {
-		addNodeToResults(pwc, results, qslots)
+		if shouldUseQSlots(*qslots, pwc, results) {
+			addNodeToResultsWithQSlots(pwc, results, qslots)
+		} else {
+			addNodeToResults(pwc, results)
+		}
 	}
 }
 
@@ -1787,7 +1844,7 @@ func reverseMatchLevel(l *level, toks []string, n *node, results *SublistResult)
 		l = n.next
 	}
 	if n != nil {
-		addNodeToResults(n, results, nil)
+		addNodeToResults(n, results)
 	}
 }
 
@@ -1796,13 +1853,13 @@ func getAllNodes(l *level, results *SublistResult) {
 		return
 	}
 	if l.pwc != nil {
-		addNodeToResults(l.pwc, results, nil)
+		addNodeToResults(l.pwc, results)
 	}
 	if l.fwc != nil {
-		addNodeToResults(l.fwc, results, nil)
+		addNodeToResults(l.fwc, results)
 	}
 	for _, n := range l.nodes {
-		addNodeToResults(n, results, nil)
+		addNodeToResults(n, results)
 		getAllNodes(n.next, results)
 	}
 }

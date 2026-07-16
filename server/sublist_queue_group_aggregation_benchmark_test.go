@@ -14,10 +14,45 @@
 package server
 
 import (
+	"fmt"
 	"strconv"
 	"sync/atomic"
 	"testing"
 )
+
+func checkQueueGroupAggregationBenchmarkResult(b *testing.B, r *SublistResult, queueGroups, matchingNodes int) {
+	b.Helper()
+	if len(r.qsubs) != queueGroups || len(r.qsubs[0]) != matchingNodes {
+		b.Fatalf("unexpected result shape: %d queue groups, %d subscriptions in first group", len(r.qsubs), len(r.qsubs[0]))
+	}
+}
+
+func BenchmarkSublistQueueGroupAggregation(b *testing.B) {
+	cases := []struct {
+		queueGroups   int
+		matchingNodes int
+	}{
+		{1, 3},
+		{4, 3},
+		{8, 3},
+		{64, 3},
+		{256, 3},
+	}
+
+	for _, tc := range cases {
+		b.Run(fmt.Sprintf("groups=%d/nodes=%d", tc.queueGroups, tc.matchingNodes), func(b *testing.B) {
+			f := newQueueGroupAggregationFixture(false, tc.queueGroups, tc.matchingNodes, false)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				r := f.sl.Match(f.subjects[i%len(f.subjects)])
+				if len(r.qsubs) != tc.queueGroups || len(r.qsubs[0]) != tc.matchingNodes {
+					b.Fatalf("unexpected result shape: %d queue groups, %d subscriptions in first group", len(r.qsubs), len(r.qsubs[0]))
+				}
+			}
+		})
+	}
+}
 
 func BenchmarkSublistQueueGroupAggregation257(b *testing.B) {
 	const (
@@ -30,6 +65,33 @@ func BenchmarkSublistQueueGroupAggregation257(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		checkQueueGroupAggregationBenchmarkResult(b, f.sl.Match(f.subjects[i%len(f.subjects)]), queueGroups, matchingNodes)
+	}
+}
+
+func BenchmarkSublistQueueGroupAggregationBoundary(b *testing.B) {
+	cases := []struct {
+		queueGroups   int
+		matchingNodes int
+	}{
+		{16, 1},
+		{16, 2},
+		{16, 3},
+		{63, 1},
+		{63, 2},
+		{63, 3},
+		{64, 1},
+		{64, 2},
+	}
+
+	for _, tc := range cases {
+		b.Run(fmt.Sprintf("groups=%d/nodes=%d", tc.queueGroups, tc.matchingNodes), func(b *testing.B) {
+			f := newQueueGroupAggregationFixture(false, tc.queueGroups, tc.matchingNodes, false)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				checkQueueGroupAggregationBenchmarkResult(b, f.sl.Match(f.subjects[i%len(f.subjects)]), tc.queueGroups, tc.matchingNodes)
+			}
+		})
 	}
 }
 
@@ -100,10 +162,55 @@ func benchmarkSublistQueueGroupAggregationCacheMiss(b *testing.B, queueGroups in
 	}
 }
 
+func BenchmarkSublistQueueGroupAggregationCacheChurn(b *testing.B) {
+	benchmarkSublistQueueGroupAggregationCacheMiss(b, 64)
+}
+
 func BenchmarkSublistQueueGroupAggregationCacheMiss(b *testing.B) {
 	for _, queueGroups := range []int{64, 257} {
 		b.Run("groups="+strconv.Itoa(queueGroups), func(b *testing.B) {
 			benchmarkSublistQueueGroupAggregationCacheMiss(b, queueGroups)
 		})
 	}
+}
+
+func BenchmarkSublistQueueGroupAggregationPoolBoundary(b *testing.B) {
+	for _, queueGroups := range []int{512, 513} {
+		b.Run(fmt.Sprintf("groups=%d/nodes=3", queueGroups), func(b *testing.B) {
+			f := newQueueGroupAggregationFixture(false, queueGroups, 3, false)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				checkQueueGroupAggregationBenchmarkResult(b, f.sl.Match(f.subjects[i%len(f.subjects)]), queueGroups, 3)
+			}
+		})
+	}
+}
+
+func BenchmarkSublistQueueGroupAggregationCacheMissPoolBoundary(b *testing.B) {
+	for _, queueGroups := range []int{512, 513} {
+		b.Run(fmt.Sprintf("groups=%d", queueGroups), func(b *testing.B) {
+			benchmarkSublistQueueGroupAggregationCacheMiss(b, queueGroups)
+		})
+	}
+}
+
+func BenchmarkSublistQueueGroupAggregationConcurrent(b *testing.B) {
+	const (
+		queueGroups   = 64
+		matchingNodes = 3
+	)
+
+	f := newQueueGroupAggregationFixture(false, queueGroups, matchingNodes, false)
+	b.ReportAllocs()
+	b.SetParallelism(4)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		subject := 0
+		for pb.Next() {
+			r := f.sl.Match(f.subjects[subject%len(f.subjects)])
+			checkQueueGroupAggregationBenchmarkResult(b, r, queueGroups, matchingNodes)
+			subject++
+		}
+	})
 }
