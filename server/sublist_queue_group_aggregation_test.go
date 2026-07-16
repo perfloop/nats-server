@@ -105,6 +105,15 @@ func newQueueGroupAggregationPromotionFixture(cache bool) *queueGroupAggregation
 	return f
 }
 
+func newQueueGroupAggregationPoolLimitPromotionFixture(cache bool) *queueGroupAggregationFixture {
+	f := newQueueGroupAggregationFixtureBase(cache, qslotMapPoolMax+1)
+	for group := 0; group < qslotMapPoolMax; group++ {
+		f.insert("perfqga.>", fmt.Sprintf("perfqga-q-%03d", group), f.subjects, false)
+	}
+	f.insert("perfqga.*", fmt.Sprintf("perfqga-q-%03d", qslotMapPoolMax), f.subjects, false)
+	return f
+}
+
 func sameSubscriptions(got, want []*subscription) bool {
 	if len(got) != len(want) {
 		return false
@@ -167,6 +176,11 @@ func TestSublistQueueGroupAggregationAcrossMatchedNodes(t *testing.T) {
 	t.Run("uncached/above-pool-limit", func(t *testing.T) {
 		checkQueueGroupAggregationFixture(t, newQueueGroupAggregationFixture(false, qslotMapPoolMax+1, 3, false))
 	})
+	for _, cache := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cache=%t/pool-limit-promotion", cache), func(t *testing.T) {
+			checkQueueGroupAggregationFixture(t, newQueueGroupAggregationPoolLimitPromotionFixture(cache))
+		})
+	}
 
 	t.Run("concurrent-uncached", func(t *testing.T) {
 		f := newQueueGroupAggregationFixture(false, qslotMapMin, 3, true)
@@ -193,6 +207,34 @@ func TestSublistQueueGroupAggregationAcrossMatchedNodes(t *testing.T) {
 		close(errs)
 		for err := range errs {
 			t.Fatal(err)
+		}
+	})
+
+	t.Run("bounded-pool", func(t *testing.T) {
+		cache := newQSlotMapCache(2)
+		for i := 0; i < 3; i++ {
+			slots := make(map[string]int, qslotMapPoolMax)
+			for j := 0; j < qslotMapPoolMax; j++ {
+				slots[fmt.Sprintf("queue-%d", j)] = j
+			}
+			cache.put(slots)
+		}
+		if got := len(cache.slots); got != 2 {
+			t.Fatalf("retained maps = %d, want 2", got)
+		}
+		for len(cache.slots) > 0 {
+			if slots := <-cache.slots; len(slots) != 0 {
+				t.Fatalf("retained map has %d entries, want 0", len(slots))
+			}
+		}
+
+		overLimit := make(map[string]int, qslotMapPoolMax+1)
+		for i := 0; i <= qslotMapPoolMax; i++ {
+			overLimit[fmt.Sprintf("queue-%d", i)] = i
+		}
+		cache.put(overLimit)
+		if got := len(cache.slots); got != 0 {
+			t.Fatalf("retained over-limit maps = %d, want 0", got)
 		}
 	})
 }

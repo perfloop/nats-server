@@ -15,7 +15,6 @@ package server
 
 import (
 	"fmt"
-	"sync/atomic"
 	"testing"
 )
 
@@ -54,33 +53,5 @@ func BenchmarkSublistQueueGroupAggregationBoundary(b *testing.B) {
 }
 
 func BenchmarkSublistQueueGroupAggregationCacheChurn(b *testing.B) {
-	const (
-		queueGroups   = 64
-		matchingNodes = 3
-	)
-
-	s := NewSublistWithCache()
-	for group := 0; group < queueGroups; group++ {
-		queue := fmt.Sprintf("perfqga-q-%03d", group)
-		for _, filter := range []string{">", "*.*", "*.tail"} {
-			if err := s.Insert(newQSub(filter, queue)); err != nil {
-				b.Fatal(err)
-			}
-		}
-	}
-
-	subjects := make([]string, b.N)
-	for i := range subjects {
-		subjects[i] = fmt.Sprintf("perfqga%d.tail", i)
-	}
-	hits := atomic.LoadUint64(&s.cacheHits)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for _, subject := range subjects {
-		checkQueueGroupAggregationBenchmarkResult(b, s.Match(subject), queueGroups, matchingNodes)
-	}
-	b.StopTimer()
-	if got := atomic.LoadUint64(&s.cacheHits) - hits; got != 0 {
-		b.Fatalf("cache hits = %d, want 0", got)
-	}
+	benchmarkSublistQueueGroupAggregationCacheMiss(b, 64)
 }

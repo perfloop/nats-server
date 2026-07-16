@@ -55,8 +55,10 @@ const (
 	plistMin = 256
 	// qslotMapMin is the lower bound for indexing queue groups during a Match.
 	qslotMapMin = 64
-	// qslotMapPoolMax is the largest queue-group map retained for reuse.
+	// qslotMapPoolMax is the largest queue-group index retained for reuse.
 	qslotMapPoolMax = 512
+	// qslotMapPoolSize bounds the process-wide number of retained maps.
+	qslotMapPoolSize = 8
 )
 
 // SublistResult is a result structure better optimized for queue subs.
@@ -531,11 +533,35 @@ func (s *Sublist) removeFromCache(subject string) {
 // a place holder for an empty result.
 var emptyResult = &SublistResult{}
 
-var qslotMapPool = sync.Pool{
-	New: func() any {
-		return make(map[string]int, qslotMapMin)
-	},
+type qslotMapCache struct {
+	slots chan map[string]int
 }
+
+func newQSlotMapCache(size int) *qslotMapCache {
+	return &qslotMapCache{slots: make(chan map[string]int, size)}
+}
+
+func (c *qslotMapCache) get() map[string]int {
+	select {
+	case slots := <-c.slots:
+		return slots
+	default:
+		return make(map[string]int, qslotMapMin)
+	}
+}
+
+func (c *qslotMapCache) put(slots map[string]int) {
+	if slots == nil || len(slots) > qslotMapPoolMax {
+		return
+	}
+	clear(slots)
+	select {
+	case c.slots <- slots:
+	default:
+	}
+}
+
+var qslotMapPool = newQSlotMapCache(qslotMapPoolSize)
 
 // Match will match all entries to the literal subject.
 // It will return a set of results for both normal and queue subscribers.
@@ -617,10 +643,7 @@ func (s *Sublist) match(subject string, doLock bool, doCopyOnCache bool) *Sublis
 
 	var qslots map[string]int
 	matchLevel(s.root, tokens, result, &qslots)
-	if qslots != nil && len(qslots) <= qslotMapPoolMax {
-		clear(qslots)
-		qslotMapPool.Put(qslots)
-	}
+	qslotMapPool.put(qslots)
 	// Check for empty result.
 	if len(result.psubs) == 0 && len(result.qsubs) == 0 {
 		result = emptyResult
@@ -741,8 +764,8 @@ func addNodeToResults(n *node, results *SublistResult, qslots *map[string]int) {
 		}
 	}
 	// Queue subscriptions
-	if qslots != nil && *qslots == nil && (len(results.qsubs) >= qslotMapMin || len(n.qsubs) >= qslotMapMin) {
-		slots := qslotMapPool.Get().(map[string]int)
+	if qslots != nil && *qslots == nil && len(results.qsubs) <= qslotMapPoolMax && len(n.qsubs) <= qslotMapPoolMax && (len(results.qsubs) >= qslotMapMin || len(n.qsubs) >= qslotMapMin) {
+		slots := qslotMapPool.get()
 		for i, qr := range results.qsubs {
 			if len(qr) > 0 {
 				slots[bytesToString(qr[0].queue)] = i
@@ -756,18 +779,29 @@ func addNodeToResults(n *node, results *SublistResult, qslots *map[string]int) {
 		}
 		// Need to find matching list in results
 		var i int
-		if qslots != nil && *qslots != nil {
+		indexed := qslots != nil && *qslots != nil
+		if indexed {
 			var ok bool
 			if i, ok = (*qslots)[qname]; !ok {
+				if len(results.qsubs) < qslotMapPoolMax {
+					i = len(results.qsubs)
+					nqsub := make([]*subscription, 0, len(qr))
+					results.qsubs = append(results.qsubs, nqsub)
+					(*qslots)[qname] = i
+				} else {
+					// Do not grow an index that exceeds the retained-map bound.
+					qslotMapPool.put(*qslots)
+					*qslots = nil
+					indexed = false
+				}
+			}
+		}
+		if !indexed {
+			if i = findQSlot([]byte(qname), results.qsubs); i < 0 {
 				i = len(results.qsubs)
 				nqsub := make([]*subscription, 0, len(qr))
 				results.qsubs = append(results.qsubs, nqsub)
-				(*qslots)[qname] = i
 			}
-		} else if i = findQSlot([]byte(qname), results.qsubs); i < 0 {
-			i = len(results.qsubs)
-			nqsub := make([]*subscription, 0, len(qr))
-			results.qsubs = append(results.qsubs, nqsub)
 		}
 		for sub := range qr {
 			if isRemoteQSub(sub) {
