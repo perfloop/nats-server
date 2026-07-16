@@ -641,9 +641,13 @@ func (s *Sublist) match(subject string, doLock bool, doCopyOnCache bool) *Sublis
 		}
 	}
 
-	var qslots map[string]int
-	matchLevel(s.root, tokens, result, &qslots)
-	qslotMapPool.put(qslots)
+	if cacheEnabled {
+		matchLevel(s.root, tokens, result)
+	} else {
+		var qslots map[string]int
+		matchLevelWithQSlots(s.root, tokens, result, &qslots)
+		qslotMapPool.put(qslots)
+	}
 	// Check for empty result.
 	if len(result.psubs) == 0 && len(result.qsubs) == 0 {
 		result = emptyResult
@@ -825,6 +829,7 @@ func addNodeToResultsWithQSlots(n *node, results *SublistResult, qslots *map[str
 		}
 		// Need to find matching list in results.
 		var i int
+		newSlot := false
 		if indexed {
 			var ok bool
 			if i, ok = slots[qname]; !ok {
@@ -832,7 +837,7 @@ func addNodeToResultsWithQSlots(n *node, results *SublistResult, qslots *map[str
 					i = len(results.qsubs)
 					nqsub := make([]*subscription, 0, len(qr))
 					results.qsubs = append(results.qsubs, nqsub)
-					slots[qname] = i
+					newSlot = true
 				} else {
 					// Do not grow an index that exceeds the retained-map bound.
 					qslotMapPool.put(slots)
@@ -859,6 +864,12 @@ func addNodeToResultsWithQSlots(n *node, results *SublistResult, qslots *map[str
 				results.qsubs[i] = append(results.qsubs[i], sub)
 			}
 		}
+		// findQSlot deliberately ignores empty slots. Only index a new slot after
+		// adding at least one subscription so a later same-name group preserves
+		// that behavior.
+		if indexed && newSlot && len(results.qsubs[i]) > 0 {
+			slots[qname] = i
+		}
 	}
 }
 
@@ -879,7 +890,34 @@ func findQSlot(queue []byte, qsl [][]*subscription) int {
 }
 
 // matchLevel is used to recursively descend into the trie.
-func matchLevel(l *level, toks []string, results *SublistResult, qslots *map[string]int) {
+func matchLevel(l *level, toks []string, results *SublistResult) {
+	var pwc, n *node
+	for i, t := range toks {
+		if l == nil {
+			return
+		}
+		if l.fwc != nil {
+			addNodeToResults(l.fwc, results)
+		}
+		if pwc = l.pwc; pwc != nil {
+			matchLevel(pwc.next, toks[i+1:], results)
+		}
+		n = l.nodes[t]
+		if n != nil {
+			l = n.next
+		} else {
+			l = nil
+		}
+	}
+	if n != nil {
+		addNodeToResults(n, results)
+	}
+	if pwc != nil {
+		addNodeToResults(pwc, results)
+	}
+}
+
+func matchLevelWithQSlots(l *level, toks []string, results *SublistResult, qslots *map[string]int) {
 	var pwc, n *node
 	for i, t := range toks {
 		if l == nil {
@@ -893,7 +931,7 @@ func matchLevel(l *level, toks []string, results *SublistResult, qslots *map[str
 			}
 		}
 		if pwc = l.pwc; pwc != nil {
-			matchLevel(pwc.next, toks[i+1:], results, qslots)
+			matchLevelWithQSlots(pwc.next, toks[i+1:], results, qslots)
 		}
 		n = l.nodes[t]
 		if n != nil {

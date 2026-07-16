@@ -16,6 +16,7 @@ package server
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -160,6 +161,50 @@ func checkQueueGroupAggregationFixture(t *testing.T, f *queueGroupAggregationFix
 				t.Fatal(err)
 			}
 		}
+	}
+}
+
+func TestSublistQueueGroupAggregationZeroWeightRemote(t *testing.T) {
+	for _, cache := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cache=%t", cache), func(t *testing.T) {
+			s := NewSublist(cache)
+			for group := 0; group < qslotMapMin-1; group++ {
+				if err := s.Insert(newQSub("perfqga.>", fmt.Sprintf("perfqga-q-%03d", group))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			zeroWeight := newRemoteQSub("perfqga.>", "perfqga-zero", 1)
+			atomic.StoreInt32(&zeroWeight.qw, 0)
+			if err := s.Insert(zeroWeight); err != nil {
+				t.Fatal(err)
+			}
+			local := newQSub("perfqga.0", "perfqga-zero")
+			if err := s.Insert(local); err != nil {
+				t.Fatal(err)
+			}
+
+			check := func(r *SublistResult) {
+				t.Helper()
+				if got, want := len(r.qsubs), qslotMapMin+1; got != want {
+					t.Fatalf("queue slots = %d, want %d", got, want)
+				}
+				if slot := findQSlot([]byte("perfqga-zero"), r.qsubs); slot < 0 || len(r.qsubs[slot]) != 1 || r.qsubs[slot][0] != local {
+					t.Fatalf("unexpected populated zero-weight queue slot")
+				}
+				empty := 0
+				for _, qsubs := range r.qsubs {
+					if len(qsubs) == 0 {
+						empty++
+					}
+				}
+				if empty != 1 {
+					t.Fatalf("empty queue slots = %d, want 1", empty)
+				}
+			}
+
+			check(s.Match("perfqga.0"))
+			check(s.Match("perfqga.0"))
+		})
 	}
 }
 
