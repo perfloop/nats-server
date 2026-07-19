@@ -6350,12 +6350,23 @@ func (c *client) getAccAndResultFromCache() (*Account, *SublistResult) {
 
 	if !ok {
 		if c.kind == ROUTER && len(c.route.accName) > 0 {
-			if acc = c.acc; acc == nil {
-				return nil, nil
+			if acc = c.acc; acc == nil || acc.IsExpired() {
+				// Dedicated routes keep their account on the route client rather
+				// than looking it up for every message. Revalidate an absent or
+				// expired account before accepting a delayed routed message.
+				if acc, _ = c.srv.LookupAccount(bytesToString(c.route.accName)); acc == nil {
+					delete(c.in.pacache, string(c.pa.pacache))
+					return nil, nil
+				}
+				c.acc = acc
 			}
 		} else {
 			// Match correct account and sublist.
 			if acc, _ = c.srv.LookupAccount(bytesToString(c.pa.account)); acc == nil {
+				// This can be an expired or removed account whose cached result
+				// is no longer usable. Do not retain derived state after the
+				// authoritative account lookup rejects it.
+				delete(c.in.pacache, string(c.pa.pacache))
 				return nil, nil
 			}
 		}
