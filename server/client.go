@@ -6339,7 +6339,6 @@ func (c *client) getAccAndResultFromCache() (*Account, *SublistResult) {
 
 		if genid := atomic.LoadUint64(&sl.genid); genid != pac.genid {
 			ok = false
-			clear(c.in.pacache)
 		} else {
 			acc = pac.acc
 			r = pac.results
@@ -6362,13 +6361,14 @@ func (c *client) getAccAndResultFromCache() (*Account, *SublistResult) {
 		// Match against the account sublist.
 		r = sl.MatchBytes(c.pa.subject)
 
-		// Check if we need to prune. This should give us a perAccountCache struct
-		// to reuse instead of having to allocate a new one.
+		// A stale entry is refreshed in place, so only a new cache key may need
+		// pruning. Pruning gives us a perAccountCache struct to reuse instead of
+		// allocating a new one.
 		// Previously we would have removed multiple entries but now we will only
 		// prune the minimum number required to maintain the cache size, so that
 		// we reduce the amount of GC pressure and maintain cache stability as best
 		// as possible.
-		if len(c.in.pacache) >= maxPerAccountCacheSize {
+		if pac == nil && len(c.in.pacache) >= maxPerAccountCacheSize {
 			for cacheKey, p := range c.in.pacache {
 				delete(c.in.pacache, cacheKey)
 				pac = p
