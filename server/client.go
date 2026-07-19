@@ -6335,9 +6335,12 @@ func (c *client) getAccAndResultFromCache() (*Account, *SublistResult) {
 		// Since v2.10.0, the config reload of accounts has been fixed
 		// and an account's sublist pointer should not change, so no need to
 		// lock to access it.
-		sl := pac.acc.sl
-
-		if genid := atomic.LoadUint64(&sl.genid); genid != pac.genid {
+		// An account resolver can expire an account while route and gateway
+		// connections retain their L1 entries. Do not use that entry even if its
+		// sublist generation has not changed.
+		if pac.acc.IsExpired() {
+			ok = false
+		} else if sl := pac.acc.sl; atomic.LoadUint64(&sl.genid) != pac.genid {
 			ok = false
 		} else {
 			acc = pac.acc
