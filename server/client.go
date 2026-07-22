@@ -530,6 +530,9 @@ func (rcf readCacheFlag) isSet(c readCacheFlag) bool {
 const (
 	defaultMaxPerAccountCacheSize  = 8192
 	defaultClosedSubsCheckInterval = 5 * time.Minute
+	// perAccountCacheDeletedGenID permanently invalidates cache entries held
+	// by an Account that has been removed from the server catalog.
+	perAccountCacheDeletedGenID uint64 = 1 << 63
 )
 
 var (
@@ -6337,9 +6340,15 @@ func (c *client) getAccAndResultFromCache() (*Account, *SublistResult) {
 		// lock to access it.
 		sl := pac.acc.sl
 
-		if genid := atomic.LoadUint64(&sl.genid); genid != pac.genid {
+		genid := atomic.LoadUint64(&sl.genid)
+		if genid != pac.genid {
 			ok = false
 			delete(c.in.pacache, string(c.pa.pacache))
+		} else if atomic.LoadUint64(&sl.genid)&perAccountCacheDeletedGenID != 0 {
+			// Reload can mark an Account between the generation comparison and
+			// returning this cached result.
+			delete(c.in.pacache, string(c.pa.pacache))
+			return nil, nil
 		} else {
 			acc = pac.acc
 			r = pac.results
@@ -6358,6 +6367,12 @@ func (c *client) getAccAndResultFromCache() (*Account, *SublistResult) {
 			}
 		}
 		sl := acc.sl
+		// Do not seed a cache entry from an Account whose deletion has begun.
+		// Existing entries have an unmarked generation and take the normal
+		// generation-mismatch path above after this marker is set.
+		if atomic.LoadUint64(&sl.genid)&perAccountCacheDeletedGenID != 0 {
+			return nil, nil
+		}
 
 		// Match against the account sublist.
 		r = sl.MatchBytes(c.pa.subject)
@@ -6383,9 +6398,14 @@ func (c *client) getAccAndResultFromCache() (*Account, *SublistResult) {
 		if pac == nil {
 			pac = &perAccountCache{}
 		}
+		genid := atomic.LoadUint64(&sl.genid)
+		// Reload may have marked the Account while MatchBytes was running.
+		if genid&perAccountCacheDeletedGenID != 0 {
+			return nil, nil
+		}
 		pac.acc = acc
 		pac.results = r
-		pac.genid = atomic.LoadUint64(&sl.genid)
+		pac.genid = genid
 
 		// Store in our cache,make sure to do so after we prune.
 		c.in.pacache[string(c.pa.pacache)] = pac

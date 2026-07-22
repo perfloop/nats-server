@@ -2205,9 +2205,10 @@ func (s *Server) reloadAuthorization() {
 			// Check check if existing account is still in opts.Accounts.
 			if _, ok := configAccs[an]; !ok {
 				deletedAccounts[an] = acc
+				// Invalidate retained per-account route and gateway cache entries
+				// before making this Account unreachable from the catalog.
+				atomic.OrUint64(&acc.sl.genid, perAccountCacheDeletedGenID)
 				s.accounts.Delete(k)
-				// Invalidate retained per-account route and gateway cache entries.
-				atomic.AddUint64(&acc.sl.genid, 1)
 			}
 			return true
 		})
@@ -2237,13 +2238,13 @@ func (s *Server) reloadAuthorization() {
 				if accClaims != nil {
 					if err := s.updateAccountWithClaimJWT(acc, claimJWT); err != nil {
 						s.Noticef("Reloaded: deleting account [bad claims]: %q", accName)
+						atomic.OrUint64(&acc.sl.genid, perAccountCacheDeletedGenID)
 						s.accounts.Delete(k)
-						atomic.AddUint64(&acc.sl.genid, 1)
 					}
 				} else {
 					s.Noticef("Reloaded: deleting account [removed]: %q", accName)
+					atomic.OrUint64(&acc.sl.genid, perAccountCacheDeletedGenID)
 					s.accounts.Delete(k)
-					atomic.AddUint64(&acc.sl.genid, 1)
 				}
 				// Regrab server lock.
 				s.mu.Lock()

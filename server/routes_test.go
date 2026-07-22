@@ -5569,6 +5569,7 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 	const configAWithBothAccounts = `
 		server_name: "A"
 		port: -1
+		no_system_account: true
 		accounts {
 			A { users: [{user: "a", password: "pwd"}] }
 			B { users: [{user: "b", password: "pwd"}] }
@@ -5581,6 +5582,7 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 	const configAWithoutB = `
 		server_name: "A"
 		port: -1
+		no_system_account: true
 		accounts {
 			A { users: [{user: "a", password: "pwd"}] }
 		}
@@ -5597,6 +5599,7 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 	confB := createConfFile(t, []byte(fmt.Sprintf(`
 		server_name: "B"
 		port: -1
+		no_system_account: true
 		accounts {
 			A { users: [{user: "a", password: "pwd"}] }
 			B { users: [{user: "b", password: "pwd"}] }
@@ -5614,7 +5617,7 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 
 	aSubConn := natsConnect(t, srvA.ClientURL(), nats.UserInfo("a", "pwd"))
 	defer aSubConn.Close()
-	bSubConn := natsConnect(t, srvA.ClientURL(), nats.UserInfo("b", "pwd"))
+	bSubConn := natsConnect(t, srvA.ClientURL(), nats.UserInfo("b", "pwd"), nats.NoReconnect())
 	defer bSubConn.Close()
 	aSub := natsSubSync(t, aSubConn, "a")
 	bSub := natsSubSync(t, bSubConn, "b")
@@ -5667,6 +5670,11 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 		t.Fatalf("lookup account B before reload: %v", err)
 	}
 	bGen := atomic.LoadUint64(&bAcc.sl.genid)
+	routeInMsgs := func(acc *Account) int64 {
+		acc.stats.Lock()
+		defer acc.stats.Unlock()
+		return acc.stats.rt.inMsgs
+	}
 
 	// Delay route-control traffic from A to B so B retains its already-known
 	// interest in b long enough to send a public routed message after A reloads.
@@ -5682,14 +5690,65 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 	})
 	srvA.mu.RUnlock()
 
-	// Remove B from the authoritative catalog before making A's cached result
-	// stale. The following A message must not make B's old cache entry usable.
-	reloadUpdateConfig(t, srvA, confA, configAWithoutB)
+	// Re-prime B with an empty result. With route-control writes held, B keeps
+	// forwarding public b messages after its last local subscriber disconnects.
+	bSubConn.Close()
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if atomic.LoadUint64(&bAcc.sl.genid) > bGen {
+			return nil
+		}
+		return fmt.Errorf("account B generation did not advance after subscriber removal")
+	})
+	bGen = atomic.LoadUint64(&bAcc.sl.genid)
+	beforeReprime := routeInMsgs(bAcc)
+	beforeReprimeRoute := atomic.LoadInt64(&route.inMsgs)
+	natsPub(t, bPub, "b", []byte("reprime-b"))
+	natsFlush(t, bPub)
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if atomic.LoadInt64(&route.inMsgs) > beforeReprimeRoute {
+			return nil
+		}
+		return fmt.Errorf("route did not receive B cache re-prime")
+	})
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if routeInMsgs(bAcc) > beforeReprime {
+			return nil
+		}
+		return fmt.Errorf("route did not re-prime B's empty result")
+	})
+
+	// Keep a bounded public B workload in flight while the authoritative
+	// catalog reload removes B. The route remains interested in B because the
+	// A-to-B control writes above are held.
+	const concurrentBMessages = 64
+	beforeConcurrent := atomic.LoadInt64(&route.inMsgs)
+	if err := os.WriteFile(confA, []byte(configAWithoutB), 0666); err != nil {
+		t.Fatalf("write removal config: %v", err)
+	}
+	reloadDone := make(chan error, 1)
+	go func() {
+		reloadDone <- srvA.Reload()
+	}()
+	for i := 0; i < concurrentBMessages; i++ {
+		if err := bPub.Publish("b", []byte(fmt.Sprintf("during-reload-%d", i))); err != nil {
+			t.Fatalf("publish B during reload: %v", err)
+		}
+	}
+	natsFlush(t, bPub)
+	if err := <-reloadDone; err != nil {
+		t.Fatalf("reload removing B: %v", err)
+	}
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if atomic.LoadInt64(&route.inMsgs) >= beforeConcurrent+concurrentBMessages {
+			return nil
+		}
+		return fmt.Errorf("route did not receive all concurrent B messages")
+	})
 	if _, err := srvA.LookupAccount("B"); err == nil {
 		t.Fatal("removed account B remained in the account catalog")
 	}
-	if currentBGen := atomic.LoadUint64(&bAcc.sl.genid); currentBGen <= bGen {
-		t.Fatalf("removed account B generation did not advance: before=%d after=%d", bGen, currentBGen)
+	if currentBGen := atomic.LoadUint64(&bAcc.sl.genid); currentBGen&perAccountCacheDeletedGenID == 0 || currentBGen <= bGen {
+		t.Fatalf("removed account B did not invalidate its cache generation: before=%d after=%d", bGen, currentBGen)
 	}
 
 	aAcc, err := srvA.LookupAccount("A")
@@ -5708,17 +5767,24 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 	natsPub(t, aPub, "a", []byte("refresh-a"))
 	natsFlush(t, aPub)
 	natsNexMsg(t, aSub, time.Second)
-	// B retains remote interest from the pre-reload subscription, so this
-	// public publish still reaches the same route after A's cache refresh.
-	beforeBRouteMessage := atomic.LoadInt64(&route.inMsgs)
-	natsPub(t, bPub, "b", []byte("removed-b"))
+	const postReloadBMessages = 16
+	beforePostReload := atomic.LoadInt64(&route.inMsgs)
+	beforePostReloadBStats := routeInMsgs(bAcc)
+	for i := 0; i < postReloadBMessages; i++ {
+		if err := bPub.Publish("b", []byte(fmt.Sprintf("after-reload-%d", i))); err != nil {
+			t.Fatalf("publish B after reload: %v", err)
+		}
+	}
 	natsFlush(t, bPub)
 	checkFor(t, time.Second, 15*time.Millisecond, func() error {
-		if atomic.LoadInt64(&route.inMsgs) > beforeBRouteMessage {
+		if atomic.LoadInt64(&route.inMsgs) >= beforePostReload+postReloadBMessages {
 			return nil
 		}
-		return fmt.Errorf("route did not receive the post-reload B message")
+		return fmt.Errorf("route did not receive all post-reload B messages")
 	})
+	if afterPostReloadBStats := routeInMsgs(bAcc); afterPostReloadBStats != beforePostReloadBStats {
+		t.Fatalf("post-reload B messages reused the removed account cache: before=%d after=%d", beforePostReloadBStats, afterPostReloadBStats)
+	}
 
 	t.Run("removed account with cached empty result", func(t *testing.T) {
 		newOpts := func(accounts ...*Account) *Options {
@@ -5769,8 +5835,8 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 		if got, _ := s.LookupAccount("B"); got != nil {
 			t.Fatal("removed account B remained in the account catalog")
 		}
-		if got := atomic.LoadUint64(&b.sl.genid); got <= bGen {
-			t.Fatalf("removed account B generation did not advance: before=%d after=%d", bGen, got)
+		if got := atomic.LoadUint64(&b.sl.genid); got&perAccountCacheDeletedGenID == 0 || got <= bGen {
+			t.Fatalf("removed account B did not invalidate its cache generation: before=%d after=%d", bGen, got)
 		}
 
 		if err := a.sl.Insert(&subscription{subject: []byte("a.refresh")}); err != nil {
@@ -5784,6 +5850,87 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 		}
 		if _, ok := c.in.pacache["B b"]; ok {
 			t.Fatal("removed account B remained in the cache after lookup")
+		}
+		if err := s.ReloadOptions(newOpts(NewAccount("A"), NewAccount("B"))); err != nil {
+			t.Fatalf("reload restoring B: %v", err)
+		}
+		restoredB, err := s.LookupAccount("B")
+		if err != nil {
+			t.Fatalf("lookup restored account B: %v", err)
+		}
+		if got, _ := cache("B", "b"); got != restoredB {
+			t.Fatalf("restored B cache lookup: got %p, want %p", got, restoredB)
+		}
+	})
+
+	t.Run("resolver removal", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			remove func(*MemAccResolver, *Account)
+		}{
+			{
+				name: "missing claim",
+				remove: func(mr *MemAccResolver, b *Account) {
+					mr.sm.Delete(b.Name)
+				},
+			},
+			{
+				name: "invalid claim",
+				remove: func(mr *MemAccResolver, b *Account) {
+					mr.sm.Store(b.Name, "invalid account claim")
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s, opts := runTrustedServer(t)
+				defer s.Shutdown()
+
+				a, _ := createAccount(s)
+				b, _ := createAccount(s)
+				bGen := atomic.LoadUint64(&b.sl.genid)
+				c := &client{
+					srv:  s,
+					kind: GATEWAY,
+					in:   readCache{pacache: make(map[string]*perAccountCache)},
+				}
+				cache := func(account, subject string) (*Account, *SublistResult) {
+					c.pa.account = []byte(account)
+					c.pa.subject = []byte(subject)
+					c.pa.pacache = []byte(account + " " + subject)
+					return c.getAccAndResultFromCache()
+				}
+
+				if got, _ := cache(b.Name, "b"); got != b {
+					t.Fatalf("initial B cache lookup: got %p, want %p", got, b)
+				}
+				if got, _ := cache(a.Name, "a"); got != a {
+					t.Fatalf("initial A cache lookup: got %p, want %p", got, a)
+				}
+				mr := s.AccountResolver().(*MemAccResolver)
+				tc.remove(mr, b)
+				if err := s.ReloadOptions(opts.Clone()); err != nil {
+					t.Fatalf("reload resolver accounts: %v", err)
+				}
+				if got, _ := s.LookupAccount(b.Name); got != nil {
+					t.Fatal("removed resolver account B remained in the account catalog")
+				}
+				if got := atomic.LoadUint64(&b.sl.genid); got&perAccountCacheDeletedGenID == 0 || got <= bGen {
+					t.Fatalf("removed resolver account B did not invalidate its cache generation: before=%d after=%d", bGen, got)
+				}
+
+				if err := a.sl.Insert(&subscription{subject: []byte("a.refresh")}); err != nil {
+					t.Fatalf("mutate resolver account A sublist: %v", err)
+				}
+				if got, _ := cache(a.Name, "a"); got != a {
+					t.Fatalf("refresh A cache lookup: got %p, want %p", got, a)
+				}
+				if got, _ := cache(b.Name, "b"); got != nil {
+					t.Fatalf("removed resolver account B remained usable from cache: %p", got)
+				}
+				if _, ok := c.in.pacache[b.Name+" b"]; ok {
+					t.Fatal("removed resolver account B remained in the cache after lookup")
+				}
+			})
 		}
 	})
 }
