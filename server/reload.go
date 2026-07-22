@@ -2206,6 +2206,8 @@ func (s *Server) reloadAuthorization() {
 			if _, ok := configAccs[an]; !ok {
 				deletedAccounts[an] = acc
 				s.accounts.Delete(k)
+				// Invalidate retained per-account route and gateway cache entries.
+				atomic.AddUint64(&acc.sl.genid, 1)
 			}
 			return true
 		})
@@ -2236,10 +2238,12 @@ func (s *Server) reloadAuthorization() {
 					if err := s.updateAccountWithClaimJWT(acc, claimJWT); err != nil {
 						s.Noticef("Reloaded: deleting account [bad claims]: %q", accName)
 						s.accounts.Delete(k)
+						atomic.AddUint64(&acc.sl.genid, 1)
 					}
 				} else {
 					s.Noticef("Reloaded: deleting account [removed]: %q", accName)
 					s.accounts.Delete(k)
+					atomic.AddUint64(&acc.sl.genid, 1)
 				}
 				// Regrab server lock.
 				s.mu.Lock()

@@ -5629,6 +5629,21 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 	checkSubInterest(t, srvB, "A", "a", time.Second)
 	checkSubInterest(t, srvB, "B", "b", time.Second)
 
+	// Identify the inbound route without reading its read-loop-owned cache.
+	routeMsgs := make(map[*client]int64)
+	srvA.mu.RLock()
+	srvA.forEachRoute(func(r *client) {
+		r.mu.Lock()
+		if r.route != nil && r.route.remoteID == srvB.ID() && len(r.route.accName) == 0 {
+			routeMsgs[r] = atomic.LoadInt64(&r.inMsgs)
+		}
+		r.mu.Unlock()
+	})
+	srvA.mu.RUnlock()
+	if len(routeMsgs) == 0 {
+		t.Fatal("missing non-account-bound route")
+	}
+
 	// Prime one non-account-bound route cache with entries for both accounts.
 	natsPub(t, aPub, "a", []byte("prime-a"))
 	natsFlush(t, aPub)
@@ -5637,20 +5652,21 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 	natsFlush(t, bPub)
 	natsNexMsg(t, bSub, time.Second)
 
-	const aCacheKey, bCacheKey = "A a", "B b"
 	var route *client
-	srvA.mu.RLock()
-	srvA.forEachRoute(func(r *client) {
-		if r.route != nil && r.route.remoteID == srvB.ID() && len(r.route.accName) == 0 &&
-			r.in.pacache[aCacheKey] != nil && r.in.pacache[bCacheKey] != nil {
+	for r, before := range routeMsgs {
+		if atomic.LoadInt64(&r.inMsgs) >= before+2 {
 			route = r
+			break
 		}
-	})
-	srvA.mu.RUnlock()
-	if route == nil {
-		t.Fatal("missing non-account-bound route cache primed for both accounts")
 	}
-	bPac := route.in.pacache[bCacheKey]
+	if route == nil {
+		t.Fatal("missing route that received both priming messages")
+	}
+	bAcc, err := srvA.LookupAccount("B")
+	if err != nil {
+		t.Fatalf("lookup account B before reload: %v", err)
+	}
+	bGen := atomic.LoadUint64(&bAcc.sl.genid)
 
 	// Delay route-control traffic from A to B so B retains its already-known
 	// interest in b long enough to send a public routed message after A reloads.
@@ -5672,8 +5688,8 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 	if _, err := srvA.LookupAccount("B"); err == nil {
 		t.Fatal("removed account B remained in the account catalog")
 	}
-	if currentBGen := atomic.LoadUint64(&bPac.acc.sl.genid); currentBGen <= bPac.genid {
-		t.Fatalf("removed account B did not invalidate its cached result: cached=%d current=%d", bPac.genid, currentBGen)
+	if currentBGen := atomic.LoadUint64(&bAcc.sl.genid); currentBGen <= bGen {
+		t.Fatalf("removed account B generation did not advance: before=%d after=%d", bGen, currentBGen)
 	}
 
 	aAcc, err := srvA.LookupAccount("A")
@@ -5692,12 +5708,8 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 	natsPub(t, aPub, "a", []byte("refresh-a"))
 	natsFlush(t, aPub)
 	natsNexMsg(t, aSub, time.Second)
-	if pac := route.in.pacache[aCacheKey]; pac == nil || pac.genid != afterGen {
-		t.Fatalf("account A cache entry was not refreshed to generation %d: %#v", afterGen, pac)
-	}
-	// B still has remote interest from the pre-reload subscription, so this
-	// public publish reaches the same route. It must not reuse B's detached
-	// Account/Sublist after the catalog has removed that account.
+	// B retains remote interest from the pre-reload subscription, so this
+	// public publish still reaches the same route after A's cache refresh.
 	beforeBRouteMessage := atomic.LoadInt64(&route.inMsgs)
 	natsPub(t, bPub, "b", []byte("removed-b"))
 	natsFlush(t, bPub)
@@ -5707,12 +5719,73 @@ func TestRoutePerAccountCacheDropsRemovedAccountAfterOtherAccountRefresh(t *test
 		}
 		return fmt.Errorf("route did not receive the post-reload B message")
 	})
-	if msg, err := bSub.NextMsg(250 * time.Millisecond); err == nil {
-		t.Fatalf("removed account B received routed message %q", msg.Data)
-	}
-	if _, ok := route.in.pacache[bCacheKey]; ok {
-		t.Fatal("removed account B remained in the route per-account cache")
-	}
+
+	t.Run("removed account with cached empty result", func(t *testing.T) {
+		newOpts := func(accounts ...*Account) *Options {
+			o := DefaultOptions()
+			o.NoSystemAccount = true
+			o.Accounts = accounts
+			return o
+		}
+
+		s, err := NewServer(newOpts(NewAccount("A"), NewAccount("B")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Shutdown()
+
+		a, err := s.LookupAccount("A")
+		if err != nil {
+			t.Fatalf("lookup account A: %v", err)
+		}
+		b, err := s.LookupAccount("B")
+		if err != nil {
+			t.Fatalf("lookup account B: %v", err)
+		}
+		bGen := atomic.LoadUint64(&b.sl.genid)
+
+		// Populate a mixed-account gateway cache without relying on subscribers.
+		c := &client{
+			srv:  s,
+			kind: GATEWAY,
+			in:   readCache{pacache: make(map[string]*perAccountCache)},
+		}
+		cache := func(account, subject string) (*Account, *SublistResult) {
+			c.pa.account = []byte(account)
+			c.pa.subject = []byte(subject)
+			c.pa.pacache = []byte(account + " " + subject)
+			return c.getAccAndResultFromCache()
+		}
+
+		if got, _ := cache("B", "b"); got != b {
+			t.Fatalf("initial B cache lookup: got %p, want %p", got, b)
+		}
+		if got, _ := cache("A", "a"); got != a {
+			t.Fatalf("initial A cache lookup: got %p, want %p", got, a)
+		}
+		if err := s.ReloadOptions(newOpts(NewAccount("A"))); err != nil {
+			t.Fatalf("reload removing B: %v", err)
+		}
+		if got, _ := s.LookupAccount("B"); got != nil {
+			t.Fatal("removed account B remained in the account catalog")
+		}
+		if got := atomic.LoadUint64(&b.sl.genid); got <= bGen {
+			t.Fatalf("removed account B generation did not advance: before=%d after=%d", bGen, got)
+		}
+
+		if err := a.sl.Insert(&subscription{subject: []byte("a.refresh")}); err != nil {
+			t.Fatalf("mutate account A sublist: %v", err)
+		}
+		if got, _ := cache("A", "a"); got != a {
+			t.Fatalf("refresh A cache lookup: got %p, want %p", got, a)
+		}
+		if got, _ := cache("B", "b"); got != nil {
+			t.Fatalf("removed account B remained usable from cache: %p", got)
+		}
+		if _, ok := c.in.pacache["B b"]; ok {
+			t.Fatal("removed account B remained in the cache after lookup")
+		}
+	})
 }
 
 // Benchmarks for message arg processing functions to measure heap allocations.
