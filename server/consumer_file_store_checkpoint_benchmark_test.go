@@ -116,40 +116,50 @@ func TestConsumerFileStoreCheckpointPersistsHighCardinalityState(t *testing.T) {
 }
 
 func benchmarkConsumerFileStoreCheckpoint(b *testing.B, pending int) {
-	fcfg := FileStoreConfig{StoreDir: b.TempDir()}
-	fs, o := newConsumerCheckpointStore(b, fcfg)
-	defer fs.Stop()
-	defer o.Stop()
-
-	if err := o.ForceUpdate(consumerCheckpointState(pending)); err != nil {
-		b.Fatalf("seeding consumer state: %v", err)
+	type benchmarkStore struct {
+		fs *fileStore
+		o  *consumerFileStore
 	}
 
-	next := uint64(pending + 2)
-	b.ResetTimer()
-	for b.Loop() {
-		if next > uint64(pending+2) {
-			// flushLoop coalesces writes for 100 ms. Keep that wait outside the
-			// measured checkpoint so every sampled operation reaches the same
-			// immediate-flush branch.
-			b.StopTimer()
-			time.Sleep(110 * time.Millisecond)
-			b.StartTimer()
+	// Each store has a fresh flush loop, so its first checkpoint takes the same
+	// immediate-flush branch without including the production coalescing delay.
+	// Creating and seeding them is setup; timing averages b.N independent
+	// high-cardinality checkpoints instead of one scheduler-sensitive wakeup.
+	stores := make([]benchmarkStore, b.N)
+	for i := range stores {
+		fcfg := FileStoreConfig{StoreDir: b.TempDir()}
+		fs, o := newConsumerCheckpointStore(b, fcfg)
+		if err := o.ForceUpdate(consumerCheckpointState(pending)); err != nil {
+			b.Fatalf("seeding consumer state: %v", err)
 		}
-		if err := o.UpdateDelivered(next, next, 1, time.Now().Round(time.Second).UnixNano()); err != nil {
+		stores[i] = benchmarkStore{fs: fs, o: o}
+	}
+	defer func() {
+		for _, store := range stores {
+			_ = store.o.Stop()
+			_ = store.fs.Stop()
+		}
+	}()
+
+	b.ResetTimer()
+	for i := 0; b.Loop(); i++ {
+		store := stores[i]
+		next := uint64(pending + 2)
+		if err := store.o.UpdateDelivered(next, next, 1, time.Now().Round(time.Second).UnixNano()); err != nil {
 			b.Fatalf("updating consumer state: %v", err)
 		}
-		waitForConsumerCheckpoint(b, o)
-		next++
+		waitForConsumerCheckpoint(b, store.o)
 	}
 	b.StopTimer()
 
-	state, err := o.State()
-	if err != nil {
-		b.Fatalf("reading consumer state: %v", err)
-	}
-	if state.Delivered.Stream != next-1 || len(state.Pending) != pending+int(next-uint64(pending+2)) {
-		b.Fatalf("unexpected final state: %+v", state)
+	for _, store := range stores {
+		state, err := store.o.State()
+		if err != nil {
+			b.Fatalf("reading consumer state: %v", err)
+		}
+		if state.Delivered.Stream != uint64(pending+2) || len(state.Pending) != pending+1 {
+			b.Fatalf("unexpected final state: %+v", state)
+		}
 	}
 }
 
