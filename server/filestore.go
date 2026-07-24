@@ -157,6 +157,10 @@ type FileConsumerInfo struct {
 	Created time.Time
 	Name    string
 	ConsumerConfig
+
+	// journal is transient state owned by the consumerFileStore that owns this
+	// configuration. It is protected by that store's mutex and is not persisted.
+	journal consumerJournalState
 }
 
 // Default file and directory permissions.
@@ -203,7 +207,6 @@ type fileStore struct {
 	fsld        chan struct{}
 	cmu         sync.RWMutex
 	cfs         []ConsumerStore
-	cj          sync.Map // *consumerFileStore -> *consumerJournalState
 	werr        error
 	sips        int
 	dirty       int
@@ -12751,6 +12754,7 @@ func (fs *fileStore) ConsumerStore(name string, created time.Time, cfg *Consumer
 	// Create channels to control our flush go routine.
 	o.fch = make(chan struct{}, 1)
 	o.qch = make(chan struct{})
+	o.journalState().flusherDone = make(chan struct{})
 
 	// Make sure to load in our state from disk if needed.
 	if err = o.loadState(); err != nil {
@@ -12762,7 +12766,7 @@ func (fs *fileStore) ConsumerStore(name string, created time.Time, cfg *Consumer
 		return nil, err
 	}
 
-	go o.flushLoop(o.fch, o.qch)
+	go o.flushLoop(o.fch, o.qch, o.journalState().flusherDone)
 	return o, nil
 }
 
@@ -12879,10 +12883,15 @@ func (o *consumerFileStore) inFlusher() bool {
 }
 
 // flushLoop watches for consumer updates and the quit channel.
-func (o *consumerFileStore) flushLoop(fch, qch chan struct{}) {
+func (o *consumerFileStore) flushLoop(fch, qch, done chan struct{}) {
 
 	o.setInFlusher()
-	defer o.clearInFlusher()
+	defer func() {
+		o.clearInFlusher()
+		if done != nil {
+			close(done)
+		}
+	}()
 
 	// Maintain approximately 10 updates per second per consumer under load.
 	const minTime = 100 * time.Millisecond
@@ -13358,7 +13367,7 @@ func (o *consumerFileStore) writeState(buf []byte) error {
 		// state as a fresh snapshot.
 		journal.snapshotPending = false
 		journal.snapshot = true
-		journal.deltas = nil
+		journal.clearDeltas()
 		o.kickFlusher()
 		o.mu.Unlock()
 		return nil
@@ -13424,7 +13433,7 @@ func (o *consumerFileStore) waitForStateWrite() {
 // Will upodate the config. Only used when recovering ephemerals.
 func (o *consumerFileStore) updateConfig(cfg ConsumerConfig) error {
 	o.mu.Lock()
-	o.cfg = &FileConsumerInfo{ConsumerConfig: cfg}
+	o.cfg.ConsumerConfig = cfg
 	o.markSnapshotLocked()
 	journal := o.journalState()
 	journal.configBarrier = true
@@ -13800,7 +13809,6 @@ func (o *consumerFileStore) Stop() error {
 	o.mu.Unlock()
 
 	o.waitOnFlusher()
-	defer fs.cj.Delete(o)
 	if err = fs.RemoveConsumer(o); err != nil {
 		return err
 	}
@@ -13815,8 +13823,11 @@ func (o *consumerFileStore) waitOnFlusher() {
 	// Closing qch makes the flusher exit after any write that it already
 	// started. Wait for that write instead of allowing Stop or Delete to race
 	// it with another replacement of the consumer state file.
-	for o.inFlusher() {
-		time.Sleep(10 * time.Millisecond)
+	o.mu.Lock()
+	done := o.journalState().flusherDone
+	o.mu.Unlock()
+	if done != nil {
+		<-done
 	}
 }
 
@@ -13847,7 +13858,6 @@ func (o *consumerFileStore) delete(streamDeleted bool) error {
 	o.mu.Unlock()
 
 	o.waitOnFlusher()
-	defer fs.cj.Delete(o)
 	// If our stream was not deleted this will remove the directories.
 	if odir != _EMPTY_ && !streamDeleted {
 		if err := removeAllWithRetry(o.fs.dios, odir); err != nil {

@@ -2854,25 +2854,15 @@ func TestFileStoreConsumerDeliveryJournalRecovery(t *testing.T) {
 			require_NoError(t, err)
 			o := store.(*consumerFileStore)
 
-			// Stop the asynchronous flusher so this test exercises the same flushState
-			// path synchronously and can assert that a journal file was written.
-			checkFor(t, time.Second, 20*time.Millisecond, func() error {
-				if !o.inFlusher() {
-					return fmt.Errorf("flusher not running")
-				}
-				return nil
-			})
+			// Stop the asynchronous flusher so this test can drive checkpoints
+			// synchronously. The later teardown deliberately does not call Stop:
+			// it models a process crash, which must not write a replacement snapshot.
 			o.mu.Lock()
 			qch := o.qch
 			o.qch = nil
 			o.mu.Unlock()
 			close(qch)
-			checkFor(t, time.Second, 20*time.Millisecond, func() error {
-				if o.inFlusher() {
-					return fmt.Errorf("flusher still running")
-				}
-				return nil
-			})
+			<-o.journalState().flusherDone
 
 			initial := &ConsumerState{
 				Delivered: SequencePair{Consumer: 1, Stream: 1},
@@ -2885,27 +2875,108 @@ func TestFileStoreConsumerDeliveryJournalRecovery(t *testing.T) {
 			ts := time.Now().UnixNano()
 			require_NoError(t, o.UpdateDelivered(2, 2, 1, ts))
 			require_NoError(t, o.writeJournalCheckpoint())
-			if _, err := os.Stat(consumerJournalFile(o)); err != nil {
-				t.Fatalf("expected consumer delivery journal: %v", err)
+			jfn := consumerJournalFile(o)
+			journal, err := os.ReadFile(jfn)
+			require_NoError(t, err)
+			if len(journal) <= consumerJournalHeaderSize {
+				t.Fatal("expected a consumer delivery journal frame")
 			}
-			// Simulate a crash during the next append. Recovery must retain the
-			// preceding validated frame and discard only this incomplete tail.
-			f, err := os.OpenFile(consumerJournalFile(o), os.O_APPEND|os.O_WRONLY, 0)
+
+			// Simulate a crash while appending the next frame. Recovery must retain
+			// the preceding validated frame and truncate only this torn tail.
+			f, err := os.OpenFile(jfn, os.O_APPEND|os.O_WRONLY, 0)
 			require_NoError(t, err)
 			_, err = f.Write([]byte{1, 2, 3})
 			require_NoError(t, err)
 			require_NoError(t, f.Close())
-			require_NoError(t, o.Stop())
+
+			// A crash loses the in-memory object without its graceful Stop snapshot.
+			o.mu.Lock()
+			o.closed = true
+			o.odir = _EMPTY_
+			o.mu.Unlock()
+			require_NoError(t, fs.RemoveConsumer(o))
 
 			store, err = fs.ConsumerStore("journal", time.Time{}, cfg)
 			require_NoError(t, err)
-			defer store.Stop()
 			got, err := store.State()
 			require_NoError(t, err)
 			require_Equal(t, got.Delivered, SequencePair{Consumer: 2, Stream: 2})
 			require_Equal(t, len(got.Pending), 2)
 			require_Equal(t, got.Pending[2].Sequence, 2)
 			require_Equal(t, got.Pending[2].Timestamp, ts)
+
+			info, err := os.Stat(jfn)
+			require_NoError(t, err)
+			require_Equal(t, info.Size(), int64(len(journal)))
+		})
+	}
+}
+
+func TestFileStoreConsumerJournalRejectsReplayedEncryptedFrame(t *testing.T) {
+	for _, cipher := range []StoreCipher{AES, ChaCha} {
+		t.Run(cipher.String(), func(t *testing.T) {
+			fcfg := FileStoreConfig{StoreDir: t.TempDir(), SyncAlways: true, Cipher: cipher}
+			fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			cfg := &ConsumerConfig{AckPolicy: AckExplicit}
+			store, err := fs.ConsumerStore("journal-replay", time.Time{}, cfg)
+			require_NoError(t, err)
+			o := store.(*consumerFileStore)
+
+			// Drive the journal directly so the two generations and their frames
+			// are deterministic. The consumer is torn down below as a crash, not
+			// via Stop, so it cannot replace the crafted journal with a snapshot.
+			o.mu.Lock()
+			qch := o.qch
+			o.qch = nil
+			o.mu.Unlock()
+			close(qch)
+			<-o.journalState().flusherDone
+
+			ts := time.Now().UnixNano()
+			require_NoError(t, o.ForceUpdate(&ConsumerState{
+				Delivered: SequencePair{Consumer: 1, Stream: 1},
+				Pending:   map[uint64]*Pending{1: {Sequence: 1, Timestamp: ts}},
+			}))
+			require_NoError(t, o.UpdateDelivered(2, 2, 1, ts+1))
+			require_NoError(t, o.writeJournalCheckpoint())
+			jfn := consumerJournalFile(o)
+			oldJournal, err := os.ReadFile(jfn)
+			require_NoError(t, err)
+			if len(oldJournal) <= consumerJournalHeaderSize {
+				t.Fatal("expected an encrypted journal frame")
+			}
+			oldFrame := append([]byte(nil), oldJournal[consumerJournalHeaderSize:]...)
+
+			// A new snapshot gives the journal a different header/generation and a
+			// new valid encrypted frame. An attacker then substitutes the old frame
+			// under the new copied header.
+			require_NoError(t, o.ForceUpdate(&ConsumerState{
+				Delivered: SequencePair{Consumer: 10, Stream: 10},
+				Pending:   map[uint64]*Pending{10: {Sequence: 10, Timestamp: ts}},
+			}))
+			require_NoError(t, o.UpdateDelivered(11, 11, 1, ts+2))
+			require_NoError(t, o.writeJournalCheckpoint())
+			currentJournal, err := os.ReadFile(jfn)
+			require_NoError(t, err)
+			if bytes.Equal(oldJournal[:consumerJournalHeaderSize], currentJournal[:consumerJournalHeaderSize]) {
+				t.Fatal("expected a new journal generation")
+			}
+			tampered := append([]byte(nil), currentJournal[:consumerJournalHeaderSize]...)
+			tampered = append(tampered, oldFrame...)
+			require_NoError(t, os.WriteFile(jfn, tampered, defaultFilePerms))
+
+			o.mu.Lock()
+			o.closed = true
+			o.odir = _EMPTY_
+			o.mu.Unlock()
+			require_NoError(t, fs.RemoveConsumer(o))
+
+			_, err = fs.ConsumerStore("journal-replay", time.Time{}, cfg)
+			require_Error(t, err)
 		})
 	}
 }
@@ -2923,23 +2994,12 @@ func TestFileStoreConsumerUpdateConfigIgnoresPriorJournal(t *testing.T) {
 
 	// Write the old configuration's state and journal synchronously so the
 	// journal survives until the configuration update writes a new snapshot.
-	checkFor(t, time.Second, 20*time.Millisecond, func() error {
-		if !o.inFlusher() {
-			return fmt.Errorf("flusher not running")
-		}
-		return nil
-	})
 	o.mu.Lock()
 	qch := o.qch
 	o.qch = nil
 	o.mu.Unlock()
 	close(qch)
-	checkFor(t, time.Second, 20*time.Millisecond, func() error {
-		if o.inFlusher() {
-			return fmt.Errorf("flusher still running")
-		}
-		return nil
-	})
+	<-o.journalState().flusherDone
 
 	ts := time.Now().UnixNano()
 	// The redelivery frame below is idempotent under the old configuration. It
@@ -2970,7 +3030,14 @@ func TestFileStoreConsumerUpdateConfigIgnoresPriorJournal(t *testing.T) {
 		t.Fatal("configuration update unexpectedly rewrote the prior journal")
 	}
 	stateFile := o.ifn
-	require_NoError(t, o.Stop())
+	// Model a crash after the new metadata is durable. Restore the old snapshot
+	// to build the historical metadata-before-snapshot artifact directly, without
+	// allowing Stop to write another full state file.
+	o.mu.Lock()
+	o.closed = true
+	o.odir = _EMPTY_
+	o.mu.Unlock()
+	require_NoError(t, fs.RemoveConsumer(o))
 	require_NoError(t, os.WriteFile(stateFile, snapshot, defaultFilePerms))
 
 	store, err = fs.ConsumerStore("config-journal", time.Time{}, newCfg)
@@ -3024,18 +3091,42 @@ func TestFileStoreConsumerStopWaitsForActiveStateWrite(t *testing.T) {
 	// This update is accepted while the first checkpoint owns the state-file
 	// write. Stop must wait for that write and persist this later delivery.
 	require_NoError(t, o.UpdateDelivered(2, 2, 1, ts+1))
+	flusherDone := o.journalState().flusherDone
+	stopStarted := make(chan struct{})
 	stopDone := make(chan error, 1)
-	go func() { stopDone <- o.Stop() }()
+	go func() {
+		close(stopStarted)
+		stopDone <- o.Stop()
+	}()
+	<-stopStarted
+	// Stop marks the consumer closed before waiting for the flusher. This is a
+	// deterministic handoff signal, not a wall-clock assertion.
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		o.mu.Lock()
+		closed := o.closed
+		o.mu.Unlock()
+		if !closed {
+			return fmt.Errorf("Stop has not begun closing the consumer")
+		}
+		return nil
+	})
 	select {
+	case <-flusherDone:
+		t.Fatal("flusher exited while its state write was still blocked")
 	case err := <-stopDone:
 		t.Fatalf("Stop returned before the active write completed: %v", err)
-	case <-time.After(150 * time.Millisecond):
+	default:
 	}
 	for range fs.dios.cap() {
 		fs.dios.release()
 	}
 	released = true
 	require_NoError(t, <-stopDone)
+	select {
+	case <-flusherDone:
+	default:
+		t.Fatal("Stop returned before the flusher exited")
+	}
 
 	store, err = fs.ConsumerStore("stop-wait", time.Time{}, cfg)
 	require_NoError(t, err)

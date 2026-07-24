@@ -27,10 +27,13 @@ import (
 )
 
 const (
-	consumerJournalVersion      = 1
-	consumerJournalHeaderSize   = 4 + 1 + sha256.Size
-	consumerJournalFrameHdrSize = 8
-	consumerJournalMaxBytes     = 1 << 20
+	consumerJournalVersion        = 1
+	consumerJournalHeaderSize     = 4 + 1 + sha256.Size
+	consumerJournalFrameHdrSize   = 8
+	consumerJournalMaxBytes       = 1 << 20
+	consumerJournalSmallPayload   = binary.MaxVarintLen64 + 4*binary.MaxVarintLen64
+	consumerJournalSmallCryptoPad = 64
+	consumerJournalSmallFrame     = consumerJournalHeaderSize + consumerJournalFrameHdrSize + consumerJournalSmallPayload + consumerJournalSmallCryptoPad
 )
 
 var (
@@ -54,17 +57,34 @@ type consumerJournalState struct {
 	snapshotPending bool
 	snapshotVersion uint64
 	version         uint64
-	deltas          []consumerDeliveryDelta
+	file            string
+	// flusherDone lets shutdown wait for an in-progress checkpoint without polling.
+	flusherDone chan struct{}
+
+	// Most flushes contain one delivery. Keep that delta and its plaintext
+	// frame inline so the ordinary checkpoint path does not allocate.
+	delta    consumerDeliveryDelta
+	hasDelta bool
+	deltas   []consumerDeliveryDelta // Additional deltas in a coalesced flush.
+	payload  [consumerJournalSmallPayload]byte
+	frame    [consumerJournalSmallFrame]byte
 }
 
-// journalState is protected by o.mu after it has been looked up.
-func (o *consumerFileStore) journalState() *consumerJournalState {
-	if journal, ok := o.fs.cj.Load(o); ok {
-		return journal.(*consumerJournalState)
+func (j *consumerJournalState) clearDeltas() {
+	j.hasDelta = false
+	j.deltas = nil
+}
+
+func (j *consumerJournalState) pendingDeltas() int {
+	if !j.hasDelta {
+		return 0
 	}
-	journal := &consumerJournalState{}
-	actual, _ := o.fs.cj.LoadOrStore(o, journal)
-	return actual.(*consumerJournalState)
+	return 1 + len(j.deltas)
+}
+
+// journalState is protected by o.mu.
+func (o *consumerFileStore) journalState() *consumerJournalState {
+	return &o.cfg.journal
 }
 
 func consumerJournalFile(o *consumerFileStore) string {
@@ -75,23 +95,29 @@ func (o *consumerFileStore) markSnapshotLocked() {
 	journal := o.journalState()
 	journal.version++
 	journal.snapshot = true
-	journal.deltas = nil
+	journal.clearDeltas()
 }
 
 func (o *consumerFileStore) recordDeliveredLocked(dseq, sseq, dc uint64, ts int64) {
 	journal := o.journalState()
 	journal.version++
 	if journal.ready && !journal.snapshot {
-		journal.deltas = append(journal.deltas, consumerDeliveryDelta{dseq, sseq, dc, ts})
+		delta := consumerDeliveryDelta{dseq, sseq, dc, ts}
+		if !journal.hasDelta {
+			journal.delta = delta
+			journal.hasDelta = true
+		} else {
+			journal.deltas = append(journal.deltas, delta)
+		}
 		return
 	}
 	journal.snapshot = true
-	journal.deltas = nil
+	journal.clearDeltas()
 }
 
 func (o *consumerFileStore) journalFlushPendingLocked() bool {
 	journal := o.journalState()
-	return journal.ready && !journal.snapshot && len(journal.deltas) > 0
+	return journal.ready && !journal.snapshot && journal.hasDelta
 }
 
 func isConsumerJournalFlushMarker(buf []byte) bool {
@@ -116,12 +142,14 @@ func (o *consumerFileStore) writeJournalCheckpoint() error {
 	version := journal.version
 	aek := o.aek
 	writeSnapshot := journal.snapshot || !journal.ready
-	if !writeSnapshot && len(journal.deltas) == 0 {
+	if !writeSnapshot && !journal.hasDelta {
 		o.dirty = false
 		o.mu.Unlock()
 		return nil
 	}
-	if !writeSnapshot && journal.bytes+int64(consumerJournalFrameMaxSize(len(journal.deltas), aek)) > consumerJournalMaxBytes {
+	if !writeSnapshot && journal.bytes+int64(consumerJournalFrameMaxSize(journal.pendingDeltas(), aek)) > consumerJournalMaxBytes {
+		// Bound restart replay and journal growth with a deliberate full-state
+		// compaction. Ordinary frame appends below this threshold stay O(delta).
 		writeSnapshot = true
 	}
 	if writeSnapshot {
@@ -133,31 +161,59 @@ func (o *consumerFileStore) writeJournalCheckpoint() error {
 		return o.writeSnapshot(buf, version)
 	}
 
+	first := journal.delta
 	deltas := journal.deltas
-	journal.deltas = nil
+	journal.clearDeltas()
 	o.writing = true
 	journalBytes := journal.bytes
 	generation := journal.generation
-	jfn := consumerJournalFile(o)
+	jfn := journal.file
+	if jfn == _EMPTY_ {
+		jfn = consumerJournalFile(o)
+		journal.file = jfn
+	}
 	o.mu.Unlock()
 
-	frame, err := encodeConsumerJournalFrame(deltas, aek)
-	if err != nil {
-		o.mu.Lock()
-		o.writing = false
-		journal := o.journalState()
-		journal.snapshot = true
-		journal.deltas = nil
-		o.dirty = true
-		o.mu.Unlock()
-		return err
-	}
-	if journalBytes == 0 {
-		data := makeConsumerJournalHeader(generation)
-		data = append(data, frame...)
-		err = o.fs.writeFileWithOptionalSync(jfn, data, defaultFilePerms)
+	// Reuse the inline frame prefix as associated data. This keeps the ordinary
+	// encrypted one-delta checkpoint allocation-free while authenticating the
+	// journal header with every frame.
+	header := journal.frame[:consumerJournalHeaderSize]
+	writeConsumerJournalHeader(header, generation)
+	var frame []byte
+	var err error
+	if len(deltas) == 0 && (aek == nil || aek.NonceSize()+aek.Overhead() <= consumerJournalSmallCryptoPad) {
+		base := journal.frame[:consumerJournalHeaderSize]
+		if aek == nil {
+			data := appendSingleConsumerJournalFrame(base, first)
+			frame = data[consumerJournalHeaderSize:]
+			if journalBytes == 0 {
+				err = o.fs.writeFileWithOptionalSync(jfn, data, defaultFilePerms)
+			} else {
+				err = o.fs.appendFileWithOptionalSync(jfn, frame, defaultFilePerms)
+			}
+		} else {
+			data, e := appendSingleEncryptedConsumerJournalFrame(base, journal.payload[:0], first, aek, header)
+			if e != nil {
+				err = e
+			} else {
+				frame = data[consumerJournalHeaderSize:]
+				if journalBytes == 0 {
+					err = o.fs.writeFileWithOptionalSync(jfn, data, defaultFilePerms)
+				} else {
+					err = o.fs.appendFileWithOptionalSync(jfn, frame, defaultFilePerms)
+				}
+			}
+		}
 	} else {
-		err = o.fs.appendFileWithOptionalSync(jfn, frame, defaultFilePerms)
+		frame, err = encodeConsumerJournalFrame(first, deltas, aek, header)
+		if err == nil {
+			if journalBytes == 0 {
+				data := append(header, frame...)
+				err = o.fs.writeFileWithOptionalSync(jfn, data, defaultFilePerms)
+			} else {
+				err = o.fs.appendFileWithOptionalSync(jfn, frame, defaultFilePerms)
+			}
+		}
 	}
 
 	o.mu.Lock()
@@ -168,7 +224,7 @@ func (o *consumerFileStore) writeJournalCheckpoint() error {
 		// A failed append may have left a partial frame. The next flush writes a
 		// complete snapshot instead of extending a journal whose tail is unknown.
 		journal.snapshot = true
-		journal.deltas = nil
+		journal.clearDeltas()
 		o.dirty = true
 		return err
 	}
@@ -177,7 +233,7 @@ func (o *consumerFileStore) writeJournalCheckpoint() error {
 	} else {
 		journal.bytes += int64(len(frame))
 	}
-	if journal.version == version && len(journal.deltas) == 0 && !journal.snapshot {
+	if journal.version == version && !journal.hasDelta && !journal.snapshot {
 		o.dirty = false
 	} else {
 		o.dirty = true
@@ -205,12 +261,13 @@ func (o *consumerFileStore) writeSnapshot(buf []byte, version uint64) error {
 	journal.generation = consumerStateGeneration(buf, &o.cfg.ConsumerConfig)
 	journal.ready = true
 	journal.bytes = 0
+	journal.file = consumerJournalFile(o)
 	if !journal.snapshotPending || journal.snapshotVersion == version {
 		journal.snapshotPending = false
 	}
 	if journal.version == version && !journal.configBarrier {
 		journal.snapshot = false
-		journal.deltas = nil
+		journal.clearDeltas()
 		o.dirty = false
 	} else {
 		journal.snapshot = true
@@ -224,7 +281,8 @@ func (o *consumerFileStore) loadJournalLocked(state *ConsumerState, generation [
 	journal.generation = generation
 	journal.ready = true
 	journal.bytes = 0
-	jfn := consumerJournalFile(o)
+	journal.file = consumerJournalFile(o)
+	jfn := journal.file
 	o.fs.dios.acquire()
 	data, err := os.ReadFile(jfn)
 	o.fs.dios.release()
@@ -281,7 +339,7 @@ func (o *consumerFileStore) loadJournalLocked(state *ConsumerState, generation [
 			if len(payload) < ns {
 				return fmt.Errorf("invalid encrypted consumer state journal frame")
 			}
-			payload, err = o.aek.Open(nil, payload[:ns], payload[ns:], nil)
+			payload, err = o.aek.Open(nil, payload[:ns], payload[ns:], data[:consumerJournalHeaderSize])
 			if err != nil {
 				return err
 			}
@@ -323,20 +381,58 @@ func consumerStateGeneration(buf []byte, cfg *ConsumerConfig) [sha256.Size]byte 
 
 func makeConsumerJournalHeader(generation [sha256.Size]byte) []byte {
 	header := make([]byte, consumerJournalHeaderSize)
-	copy(header, consumerJournalMagic[:])
-	header[4] = consumerJournalVersion
-	copy(header[5:], generation[:])
+	writeConsumerJournalHeader(header, generation)
 	return header
 }
 
-func encodeConsumerJournalFrame(deltas []consumerDeliveryDelta, aek cipher.AEAD) ([]byte, error) {
-	payload := make([]byte, 0, consumerJournalFrameMaxSize(len(deltas), nil)-consumerJournalFrameHdrSize)
-	payload = binary.AppendUvarint(payload, uint64(len(deltas)))
+func writeConsumerJournalHeader(header []byte, generation [sha256.Size]byte) {
+	copy(header, consumerJournalMagic[:])
+	header[4] = consumerJournalVersion
+	copy(header[5:], generation[:])
+}
+
+func appendSingleConsumerJournalFrame(dst []byte, delta consumerDeliveryDelta) []byte {
+	start := len(dst)
+	dst = append(dst, 0, 0, 0, 0, 0, 0, 0, 0)
+	dst = binary.AppendUvarint(dst, 1)
+	dst = binary.AppendUvarint(dst, delta.dseq)
+	dst = binary.AppendUvarint(dst, delta.sseq)
+	dst = binary.AppendUvarint(dst, delta.dc)
+	dst = binary.AppendVarint(dst, delta.ts)
+	payload := dst[start+consumerJournalFrameHdrSize:]
+	binary.BigEndian.PutUint32(dst[start:], uint32(len(payload)))
+	binary.BigEndian.PutUint32(dst[start+4:], crc32.ChecksumIEEE(payload))
+	return dst
+}
+
+func appendSingleEncryptedConsumerJournalFrame(dst, plaintext []byte, delta consumerDeliveryDelta, aek cipher.AEAD, aad []byte) ([]byte, error) {
+	start := len(dst)
+	dst = append(dst, 0, 0, 0, 0, 0, 0, 0, 0)
+	plaintext = binary.AppendUvarint(plaintext, 1)
+	plaintext = appendConsumerJournalDelta(plaintext, delta)
+
+	nonceStart := len(dst)
+	dst = dst[:nonceStart+aek.NonceSize()]
+	nonce := dst[nonceStart:]
+	if n, err := rand.Read(nonce); err != nil {
+		return nil, err
+	} else if n != len(nonce) {
+		return nil, fmt.Errorf("not enough nonce bytes read (%d != %d)", n, len(nonce))
+	}
+	payloadStart := start + consumerJournalFrameHdrSize
+	payload := aek.Seal(dst[payloadStart:payloadStart+aek.NonceSize()], nonce, plaintext, aad)
+	dst = dst[:payloadStart+len(payload)]
+	binary.BigEndian.PutUint32(dst[start:], uint32(len(payload)))
+	binary.BigEndian.PutUint32(dst[start+4:], crc32.ChecksumIEEE(payload))
+	return dst, nil
+}
+
+func encodeConsumerJournalFrame(first consumerDeliveryDelta, deltas []consumerDeliveryDelta, aek cipher.AEAD, aad []byte) ([]byte, error) {
+	payload := make([]byte, 0, consumerJournalFrameMaxSize(1+len(deltas), nil)-consumerJournalFrameHdrSize)
+	payload = binary.AppendUvarint(payload, uint64(1+len(deltas)))
+	payload = appendConsumerJournalDelta(payload, first)
 	for _, delta := range deltas {
-		payload = binary.AppendUvarint(payload, delta.dseq)
-		payload = binary.AppendUvarint(payload, delta.sseq)
-		payload = binary.AppendUvarint(payload, delta.dc)
-		payload = binary.AppendVarint(payload, delta.ts)
+		payload = appendConsumerJournalDelta(payload, delta)
 	}
 	if aek != nil {
 		nonce := make([]byte, aek.NonceSize(), aek.NonceSize()+len(payload)+aek.Overhead())
@@ -345,13 +441,20 @@ func encodeConsumerJournalFrame(deltas []consumerDeliveryDelta, aek cipher.AEAD)
 		} else if n != len(nonce) {
 			return nil, fmt.Errorf("not enough nonce bytes read (%d != %d)", n, len(nonce))
 		}
-		payload = aek.Seal(nonce, nonce, payload, nil)
+		payload = aek.Seal(nonce, nonce, payload, aad)
 	}
 	frame := make([]byte, consumerJournalFrameHdrSize+len(payload))
 	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
 	binary.BigEndian.PutUint32(frame[4:8], crc32.ChecksumIEEE(payload))
 	copy(frame[consumerJournalFrameHdrSize:], payload)
 	return frame, nil
+}
+
+func appendConsumerJournalDelta(dst []byte, delta consumerDeliveryDelta) []byte {
+	dst = binary.AppendUvarint(dst, delta.dseq)
+	dst = binary.AppendUvarint(dst, delta.sseq)
+	dst = binary.AppendUvarint(dst, delta.dc)
+	return binary.AppendVarint(dst, delta.ts)
 }
 
 func consumerJournalFrameMaxSize(deltas int, aek cipher.AEAD) int {
