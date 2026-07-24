@@ -115,6 +115,8 @@ func TestConsumerFileStoreCheckpointPersistsHighCardinalityState(t *testing.T) {
 	}
 }
 
+const consumerCheckpointSamples = 64
+
 func benchmarkConsumerFileStoreCheckpoint(b *testing.B, pending int) {
 	type benchmarkStore struct {
 		fs *fileStore
@@ -123,9 +125,10 @@ func benchmarkConsumerFileStoreCheckpoint(b *testing.B, pending int) {
 
 	// Each store has a fresh flush loop, so its first checkpoint takes the same
 	// immediate-flush branch without including the production coalescing delay.
-	// Creating and seeding them is setup; timing averages b.N independent
-	// high-cardinality checkpoints instead of one scheduler-sensitive wakeup.
-	stores := make([]benchmarkStore, b.N)
+	// Creating and seeding them is setup; the sealed -benchtime=64x command then
+	// averages independent high-cardinality checkpoints instead of one
+	// scheduler-sensitive wakeup.
+	stores := make([]benchmarkStore, consumerCheckpointSamples)
 	for i := range stores {
 		fcfg := FileStoreConfig{StoreDir: b.TempDir()}
 		fs, o := newConsumerCheckpointStore(b, fcfg)
@@ -141,8 +144,10 @@ func benchmarkConsumerFileStoreCheckpoint(b *testing.B, pending int) {
 		}
 	}()
 
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
+		if i == len(stores) {
+			b.Fatal("consumer checkpoint benchmark requires -benchtime=64x")
+		}
 		store := stores[i]
 		next := uint64(pending + 2)
 		if err := store.o.UpdateDelivered(next, next, 1, time.Now().Round(time.Second).UnixNano()); err != nil {
@@ -150,7 +155,6 @@ func benchmarkConsumerFileStoreCheckpoint(b *testing.B, pending int) {
 		}
 		waitForConsumerCheckpoint(b, store.o)
 	}
-	b.StopTimer()
 
 	for _, store := range stores {
 		state, err := store.o.State()
