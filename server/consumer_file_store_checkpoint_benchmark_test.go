@@ -47,19 +47,21 @@ func newConsumerCheckpointStore(tb testing.TB, fcfg FileStoreConfig) (*fileStore
 	return fs, store.(*consumerFileStore)
 }
 
-func waitForConsumerCheckpoint(tb testing.TB, o *consumerFileStore) {
-	tb.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		o.mu.Lock()
-		complete := !o.dirty && !o.writing
-		o.mu.Unlock()
-		if complete {
-			return
+func armConsumerCheckpoint(o *consumerFileStore) (<-chan error, func()) {
+	done := make(chan error, 1)
+	o.mu.Lock()
+	o.testFlushDone = func(err error) {
+		select {
+		case done <- err:
+		default:
 		}
-		time.Sleep(time.Millisecond)
 	}
-	tb.Fatal("consumer checkpoint did not complete")
+	o.mu.Unlock()
+	return done, func() {
+		o.mu.Lock()
+		o.testFlushDone = nil
+		o.mu.Unlock()
+	}
 }
 
 func checkpointConsumerState(tb testing.TB, o *consumerFileStore, pending int) *ConsumerState {
@@ -67,11 +69,15 @@ func checkpointConsumerState(tb testing.TB, o *consumerFileStore, pending int) *
 	if err := o.ForceUpdate(consumerCheckpointState(pending)); err != nil {
 		tb.Fatalf("seeding consumer state: %v", err)
 	}
+	done, disarm := armConsumerCheckpoint(o)
+	defer disarm()
 	next := uint64(pending + 2)
 	if err := o.UpdateDelivered(next, next, 1, time.Now().Round(time.Second).UnixNano()); err != nil {
 		tb.Fatalf("updating consumer state: %v", err)
 	}
-	waitForConsumerCheckpoint(tb, o)
+	if err := <-done; err != nil {
+		tb.Fatalf("flushing consumer state: %v", err)
+	}
 	state, err := o.State()
 	if err != nil {
 		tb.Fatalf("reading consumer state: %v", err)
@@ -119,8 +125,10 @@ const consumerCheckpointSamples = 64
 
 func benchmarkConsumerFileStoreCheckpoint(b *testing.B, pending int) {
 	type benchmarkStore struct {
-		fs *fileStore
-		o  *consumerFileStore
+		fs     *fileStore
+		o      *consumerFileStore
+		done   <-chan error
+		disarm func()
 	}
 
 	// Each store has a fresh flush loop, so its first checkpoint takes the same
@@ -135,7 +143,8 @@ func benchmarkConsumerFileStoreCheckpoint(b *testing.B, pending int) {
 		if err := o.ForceUpdate(consumerCheckpointState(pending)); err != nil {
 			b.Fatalf("seeding consumer state: %v", err)
 		}
-		stores[i] = benchmarkStore{fs: fs, o: o}
+		done, disarm := armConsumerCheckpoint(o)
+		stores[i] = benchmarkStore{fs: fs, o: o, done: done, disarm: disarm}
 	}
 	defer func() {
 		for _, store := range stores {
@@ -153,10 +162,13 @@ func benchmarkConsumerFileStoreCheckpoint(b *testing.B, pending int) {
 		if err := store.o.UpdateDelivered(next, next, 1, time.Now().Round(time.Second).UnixNano()); err != nil {
 			b.Fatalf("updating consumer state: %v", err)
 		}
-		waitForConsumerCheckpoint(b, store.o)
+		if err := <-store.done; err != nil {
+			b.Fatalf("flushing consumer state: %v", err)
+		}
 	}
 
 	for _, store := range stores {
+		store.disarm()
 		state, err := store.o.State()
 		if err != nil {
 			b.Fatalf("reading consumer state: %v", err)
@@ -173,15 +185,4 @@ func BenchmarkConsumerFileStoreCheckpointPending16(b *testing.B) {
 
 func BenchmarkConsumerFileStoreCheckpointPending32768(b *testing.B) {
 	benchmarkConsumerFileStoreCheckpoint(b, 32768)
-}
-
-func BenchmarkConsumerFileStoreCheckpointEncodeProfile(b *testing.B) {
-	state := consumerCheckpointState(32768)
-	var total int
-	for b.Loop() {
-		total += len(encodeConsumerState(state))
-	}
-	if total == 0 {
-		b.Fatal("consumer state was not encoded")
-	}
 }

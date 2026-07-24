@@ -12603,22 +12603,23 @@ func pruneDeleteBlock(db DeleteBlock, blocks DeleteBlocks) (bool, DeleteBlocks) 
 ////////////////////////////////////////////////////////////////////////////////
 
 type consumerFileStore struct {
-	mu      sync.Mutex
-	fs      *fileStore
-	cfg     *FileConsumerInfo
-	prf     keyGen
-	aek     cipher.AEAD
-	name    string
-	odir    string
-	ifn     string
-	hh      *highwayhash.Digest64
-	state   ConsumerState
-	fch     chan struct{}
-	qch     chan struct{}
-	flusher bool
-	writing bool
-	dirty   bool
-	closed  bool
+	mu            sync.Mutex
+	fs            *fileStore
+	cfg           *FileConsumerInfo
+	prf           keyGen
+	aek           cipher.AEAD
+	name          string
+	odir          string
+	ifn           string
+	hh            *highwayhash.Digest64
+	state         ConsumerState
+	fch           chan struct{}
+	qch           chan struct{}
+	flusher       bool
+	writing       bool
+	dirty         bool
+	closed        bool
+	testFlushDone func(error)
 }
 
 func (fs *fileStore) ConsumerStore(name string, created time.Time, cfg *ConsumerConfig) (ConsumerStore, error) {
@@ -12840,6 +12841,15 @@ func (o *consumerFileStore) clearInFlusher() {
 	o.mu.Unlock()
 }
 
+func (o *consumerFileStore) notifyFlushDone(err error) {
+	o.mu.Lock()
+	done := o.testFlushDone
+	o.mu.Unlock()
+	if done != nil {
+		done(err)
+	}
+}
+
 // Report in flusher status
 func (o *consumerFileStore) inFlusher() bool {
 	o.mu.Lock()
@@ -12891,11 +12901,15 @@ func (o *consumerFileStore) flushLoop(fch, qch chan struct{}) {
 			buf, err := o.encodeState()
 			o.mu.Unlock()
 			if err != nil {
+				o.notifyFlushDone(err)
 				return
 			}
 			// TODO(dlc) - if we error should start failing upwards.
 			if err := o.writeState(buf); err == nil {
 				lastWrite = time.Now()
+				o.notifyFlushDone(nil)
+			} else {
+				o.notifyFlushDone(err)
 			}
 		case <-qch:
 			return
