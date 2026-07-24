@@ -128,6 +128,14 @@ func benchmarkConsumerFileStoreCheckpoint(b *testing.B, pending int) {
 	next := uint64(pending + 2)
 	b.ResetTimer()
 	for b.Loop() {
+		if next > uint64(pending+2) {
+			// flushLoop coalesces writes for 100 ms. Keep that wait outside the
+			// measured checkpoint so every sampled operation reaches the same
+			// immediate-flush branch.
+			b.StopTimer()
+			time.Sleep(110 * time.Millisecond)
+			b.StartTimer()
+		}
 		if err := o.UpdateDelivered(next, next, 1, time.Now().Round(time.Second).UnixNano()); err != nil {
 			b.Fatalf("updating consumer state: %v", err)
 		}
