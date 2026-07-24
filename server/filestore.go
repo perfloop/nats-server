@@ -203,6 +203,7 @@ type fileStore struct {
 	fsld        chan struct{}
 	cmu         sync.RWMutex
 	cfs         []ConsumerStore
+	cj          sync.Map // *consumerFileStore -> *consumerJournalState
 	werr        error
 	sips        int
 	dirty       int
@@ -12298,7 +12299,7 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, includeConsumers bool, err
 		sum := []byte(hex.EncodeToString(o.hh.Sum(hb[:0])))
 
 		// We can have the running state directly encoded now.
-		state, err := o.encodeState()
+		state, err := o.encodeFullStateLocked()
 		if err != nil {
 			o.mu.Unlock()
 			writeErr(fmt.Sprintf("Could not encode consumer state for %q: %v", o.name, err))
@@ -12715,26 +12716,33 @@ func (fs *fileStore) ConsumerStore(name string, created time.Time, cfg *Consumer
 	if o.prf != nil {
 		keyFile := filepath.Join(odir, JetStreamMetaFileKey)
 		if _, err := os.Stat(keyFile); err != nil && os.IsNotExist(err) {
+			// Replay any plaintext journal before creating the key file. The
+			// replacement snapshot below then becomes the encrypted base for
+			// future journal frames.
+			var stateBuf []byte
+			if buf, err := os.ReadFile(o.ifn); err == nil {
+				if state, err := decodeConsumerState(buf); err == nil {
+					if err := o.loadJournalLocked(state, consumerStateGeneration(buf, &o.cfg.ConsumerConfig)); err != nil {
+						if didCreate {
+							_ = os.RemoveAll(odir)
+						}
+						return nil, err
+					}
+					stateBuf = encodeConsumerState(state)
+				}
+			}
 			if err := o.writeConsumerMeta(); err != nil {
 				if didCreate {
 					_ = os.RemoveAll(odir)
 				}
 				return nil, err
 			}
-			// Redo the state file as well here if we have one and we can tell it was plaintext.
-			if buf, err := os.ReadFile(o.ifn); err == nil {
-				if _, err := decodeConsumerState(buf); err == nil {
-					state, err := o.encryptState(buf)
-					if err != nil {
-						return nil, err
+			if len(stateBuf) > 0 {
+				if err := o.writeSnapshot(stateBuf, o.journalState().version); err != nil {
+					if didCreate {
+						_ = os.RemoveAll(odir)
 					}
-					err = fs.writeFileWithOptionalSync(o.ifn, state, defaultFilePerms)
-					if err != nil {
-						if didCreate {
-							_ = os.RemoveAll(odir)
-						}
-						return nil, err
-					}
+					return nil, err
 				}
 			}
 		}
@@ -12804,6 +12812,18 @@ func (o *consumerFileStore) convertCipher() error {
 	if err != nil {
 		return err
 	}
+	state, err := decodeConsumerState(buf)
+	if err != nil {
+		return err
+	}
+	// Replay a journal with the old data-encryption key before replacing the
+	// snapshot and generating a key for the new cipher.
+	o.aek = aek
+	if err := o.loadJournalLocked(state, consumerStateGeneration(buf, &o.cfg.ConsumerConfig)); err != nil {
+		return err
+	}
+	buf = encodeConsumerState(state)
+	o.aek = nil
 
 	// Since we are here we recovered our old state.
 	// Now write our meta, which will generate the new keys with the new cipher.
@@ -12811,8 +12831,9 @@ func (o *consumerFileStore) convertCipher() error {
 		return err
 	}
 
-	// Now write out or state with the new cipher.
-	return o.writeState(buf)
+	// Now write out our state with the new cipher. A changed snapshot generation
+	// prevents any old journal frames from being replayed after conversion.
+	return o.writeSnapshot(buf, o.journalState().version)
 }
 
 // Kick flusher for this consumer.
@@ -12922,9 +12943,11 @@ func (o *consumerFileStore) SetStarting(sseq uint64) error {
 	o.mu.Lock()
 	o.state.Delivered.Stream = sseq
 	o.state.AckFloor.Stream = sseq
+	o.markSnapshotLocked()
+	version := o.journalState().version
 	buf := encodeConsumerState(&o.state)
 	o.mu.Unlock()
-	return o.writeState(buf)
+	return o.writeSnapshot(buf, version)
 }
 
 // UpdateStarting updates our starting stream sequence.
@@ -12940,6 +12963,7 @@ func (o *consumerFileStore) UpdateStarting(sseq uint64) {
 		}
 	}
 	// Make sure we flush to disk.
+	o.markSnapshotLocked()
 	o.kickFlusher()
 }
 
@@ -13028,6 +13052,7 @@ func (o *consumerFileStore) UpdateDelivered(dseq, sseq, dc uint64, ts int64) err
 		}
 	}
 	// Make sure we flush to disk.
+	o.recordDeliveredLocked(dseq, sseq, dc, ts)
 	o.kickFlusher()
 
 	return nil
@@ -13045,6 +13070,7 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 	var kick bool
 	defer func() {
 		if kick {
+			o.markSnapshotLocked()
 			o.kickFlusher()
 		}
 	}()
@@ -13133,6 +13159,7 @@ func (o *consumerFileStore) RemoveRedeliveredBelow(seq uint64) {
 		}
 	}
 	if removed {
+		o.markSnapshotLocked()
 		o.kickFlusher()
 	}
 }
@@ -13145,10 +13172,20 @@ const seqsHdrSize = 6*binary.MaxVarintLen64 + hdrLen
 func (o *consumerFileStore) EncodedState() ([]byte, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.encodeState()
+	return o.encodeFullStateLocked()
 }
 
 func (o *consumerFileStore) encodeState() ([]byte, error) {
+	if o.journalFlushPendingLocked() {
+		return consumerJournalFlushMarker[:], nil
+	}
+	journal := o.journalState()
+	journal.snapshotVersion = journal.version
+	journal.snapshotPending = true
+	return o.encodeFullStateLocked()
+}
+
+func (o *consumerFileStore) encodeFullStateLocked() ([]byte, error) {
 	// Grab reference to state, but make sure we load in if needed, so do not reference o.state directly.
 	state, err := o.stateWithCopyLocked(false)
 	if err != nil {
@@ -13159,13 +13196,40 @@ func (o *consumerFileStore) encodeState() ([]byte, error) {
 
 func (o *consumerFileStore) UpdateConfig(cfg *ConsumerConfig) error {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 
 	// This is mostly unchecked here. We are assuming the upper layers have done sanity checking.
 	csi := o.cfg
 	csi.ConsumerConfig = *cfg
+	// Delivery frames are replayed with the consumer configuration. First
+	// establish a snapshot whose generation is bound to the new replay rules,
+	// then publish the metadata, and finally clear the barrier with a complete
+	// snapshot. This ordering leaves either configuration with a safe base after
+	// a crash between the files.
+	o.markSnapshotLocked()
+	journal := o.journalState()
+	journal.configBarrier = true
+	version := journal.version
+	buf, err := o.encodeFullStateLocked()
+	o.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err = o.writeSnapshot(buf, version); err != nil {
+		return err
+	}
 
-	return o.writeConsumerMeta()
+	o.mu.Lock()
+	if err = o.writeConsumerMeta(); err == nil {
+		journal = o.journalState()
+		journal.configBarrier = false
+		version = journal.version
+		buf, err = o.encodeFullStateLocked()
+	}
+	o.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return o.writeSnapshot(buf, version)
 }
 
 func (o *consumerFileStore) Update(state *ConsumerState) error {
@@ -13210,6 +13274,7 @@ func (o *consumerFileStore) Update(state *ConsumerState) error {
 	o.state.Pending = pending
 	o.state.Redelivered = redelivered
 
+	o.markSnapshotLocked()
 	o.kickFlusher()
 
 	return nil
@@ -13251,12 +13316,14 @@ func (o *consumerFileStore) ForceUpdate(state *ConsumerState) error {
 	o.state.AckFloor = state.AckFloor
 	o.state.Pending = pending
 	o.state.Redelivered = redelivered
-	buf, err := o.encodeState()
+	o.markSnapshotLocked()
+	version := o.journalState().version
+	buf, err := o.encodeFullStateLocked()
 	o.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	return o.writeState(buf)
+	return o.writeSnapshot(buf, version)
 }
 
 // Will encrypt the state with our asset key. Will be a no-op if encryption not enabled.
@@ -13275,10 +13342,42 @@ func (o *consumerFileStore) encryptState(buf []byte) ([]byte, error) {
 	return o.aek.Seal(nonce, nonce, buf, nil), nil
 }
 
+var errConsumerStateWriteInProgress = errors.New("consumer state write in progress")
+
 func (o *consumerFileStore) writeState(buf []byte) error {
+	if isConsumerJournalFlushMarker(buf) {
+		return o.writeJournalCheckpoint()
+	}
+	o.mu.Lock()
+	journal := o.journalState()
+	pending := journal.snapshotPending
+	version := journal.snapshotVersion
+	if pending && journal.version != version {
+		// A mutation arrived after this full buffer was encoded. Do not let
+		// the stale buffer overwrite it; the queued flush will encode current
+		// state as a fresh snapshot.
+		journal.snapshotPending = false
+		journal.snapshot = true
+		journal.deltas = nil
+		o.kickFlusher()
+		o.mu.Unlock()
+		return nil
+	}
+	o.mu.Unlock()
+	if pending {
+		return o.writeSnapshot(buf, version)
+	}
+	return o.writeRawState(buf)
+}
+
+func (o *consumerFileStore) writeRawState(buf []byte) error {
 	// Check if we have the index file open.
 	o.mu.Lock()
-	if o.writing || len(buf) == 0 {
+	if o.writing {
+		o.mu.Unlock()
+		return errConsumerStateWriteInProgress
+	}
+	if len(buf) == 0 {
 		o.mu.Unlock()
 		return nil
 	}
@@ -13310,12 +13409,47 @@ func (o *consumerFileStore) writeState(buf []byte) error {
 	return err
 }
 
+func (o *consumerFileStore) waitForStateWrite() {
+	for {
+		o.mu.Lock()
+		writing := o.writing
+		o.mu.Unlock()
+		if !writing {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // Will upodate the config. Only used when recovering ephemerals.
 func (o *consumerFileStore) updateConfig(cfg ConsumerConfig) error {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	o.cfg = &FileConsumerInfo{ConsumerConfig: cfg}
-	return o.writeConsumerMeta()
+	o.markSnapshotLocked()
+	journal := o.journalState()
+	journal.configBarrier = true
+	version := journal.version
+	buf, err := o.encodeFullStateLocked()
+	o.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err = o.writeSnapshot(buf, version); err != nil {
+		return err
+	}
+
+	o.mu.Lock()
+	if err = o.writeConsumerMeta(); err == nil {
+		journal = o.journalState()
+		journal.configBarrier = false
+		version = journal.version
+		buf, err = o.encodeFullStateLocked()
+	}
+	o.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return o.writeSnapshot(buf, version)
 }
 
 // Write out the consumer meta data, i.e. state.
@@ -13478,6 +13612,9 @@ func (o *consumerFileStore) stateWithCopyLocked(doCopy bool) (*ConsumerState, er
 
 	state, err = decodeConsumerState(buf)
 	if err != nil {
+		return nil, err
+	}
+	if err := o.loadJournalLocked(state, consumerStateGeneration(buf, &o.cfg.ConsumerConfig)); err != nil {
 		return nil, err
 	}
 
@@ -13647,45 +13784,38 @@ func (o *consumerFileStore) Stop() error {
 
 	var err error
 	var buf []byte
+	var version uint64
 
 	if o.dirty {
-		// Make sure to write this out..
-		if buf, err = o.encodeState(); err == nil && len(buf) > 0 {
-			if o.aek != nil {
-				if buf, err = o.encryptState(buf); err != nil {
-					o.mu.Unlock()
-					return err
-				}
-			}
+		// Make sure to write this out as a full snapshot before stopping.
+		o.markSnapshotLocked()
+		if buf, err = o.encodeFullStateLocked(); err == nil && len(buf) > 0 {
+			version = o.journalState().version
 		}
 	}
 
 	o.odir = _EMPTY_
 	o.closed = true
-	ifn, fs := o.ifn, o.fs
+	fs := o.fs
 	o.mu.Unlock()
 
+	o.waitOnFlusher()
+	defer fs.cj.Delete(o)
 	if err = fs.RemoveConsumer(o); err != nil {
 		return err
 	}
 
 	if len(buf) > 0 {
-		o.waitOnFlusher()
-		err = o.fs.writeFileWithOptionalSync(ifn, buf, defaultFilePerms)
+		err = o.writeSnapshot(buf, version)
 	}
 	return err
 }
 
 func (o *consumerFileStore) waitOnFlusher() {
-	if !o.inFlusher() {
-		return
-	}
-
-	timeout := time.Now().Add(100 * time.Millisecond)
-	for time.Now().Before(timeout) {
-		if !o.inFlusher() {
-			return
-		}
+	// Closing qch makes the flusher exit after any write that it already
+	// started. Wait for that write instead of allowing Stop or Delete to race
+	// it with another replacement of the consumer state file.
+	for o.inFlusher() {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -13716,6 +13846,8 @@ func (o *consumerFileStore) delete(streamDeleted bool) error {
 	fs := o.fs
 	o.mu.Unlock()
 
+	o.waitOnFlusher()
+	defer fs.cj.Delete(o)
 	// If our stream was not deleted this will remove the directories.
 	if odir != _EMPTY_ && !streamDeleted {
 		if err := removeAllWithRetry(o.fs.dios, odir); err != nil {

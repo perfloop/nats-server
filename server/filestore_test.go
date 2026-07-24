@@ -2841,6 +2841,211 @@ func TestFileStoreConsumerFlusher(t *testing.T) {
 	})
 }
 
+func TestFileStoreConsumerDeliveryJournalRecovery(t *testing.T) {
+	for _, cipher := range []StoreCipher{NoCipher, AES, ChaCha} {
+		t.Run(cipher.String(), func(t *testing.T) {
+			fcfg := FileStoreConfig{StoreDir: t.TempDir(), SyncAlways: true, Cipher: cipher}
+			fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
+			require_NoError(t, err)
+			defer fs.Stop()
+
+			cfg := &ConsumerConfig{AckPolicy: AckExplicit}
+			store, err := fs.ConsumerStore("journal", time.Time{}, cfg)
+			require_NoError(t, err)
+			o := store.(*consumerFileStore)
+
+			// Stop the asynchronous flusher so this test exercises the same flushState
+			// path synchronously and can assert that a journal file was written.
+			checkFor(t, time.Second, 20*time.Millisecond, func() error {
+				if !o.inFlusher() {
+					return fmt.Errorf("flusher not running")
+				}
+				return nil
+			})
+			o.mu.Lock()
+			qch := o.qch
+			o.qch = nil
+			o.mu.Unlock()
+			close(qch)
+			checkFor(t, time.Second, 20*time.Millisecond, func() error {
+				if o.inFlusher() {
+					return fmt.Errorf("flusher still running")
+				}
+				return nil
+			})
+
+			initial := &ConsumerState{
+				Delivered: SequencePair{Consumer: 1, Stream: 1},
+				AckFloor:  SequencePair{},
+				Pending: map[uint64]*Pending{
+					1: {Sequence: 1, Timestamp: time.Now().Add(-time.Second).UnixNano()},
+				},
+			}
+			require_NoError(t, o.ForceUpdate(initial))
+			ts := time.Now().UnixNano()
+			require_NoError(t, o.UpdateDelivered(2, 2, 1, ts))
+			require_NoError(t, o.writeJournalCheckpoint())
+			if _, err := os.Stat(consumerJournalFile(o)); err != nil {
+				t.Fatalf("expected consumer delivery journal: %v", err)
+			}
+			// Simulate a crash during the next append. Recovery must retain the
+			// preceding validated frame and discard only this incomplete tail.
+			f, err := os.OpenFile(consumerJournalFile(o), os.O_APPEND|os.O_WRONLY, 0)
+			require_NoError(t, err)
+			_, err = f.Write([]byte{1, 2, 3})
+			require_NoError(t, err)
+			require_NoError(t, f.Close())
+			require_NoError(t, o.Stop())
+
+			store, err = fs.ConsumerStore("journal", time.Time{}, cfg)
+			require_NoError(t, err)
+			defer store.Stop()
+			got, err := store.State()
+			require_NoError(t, err)
+			require_Equal(t, got.Delivered, SequencePair{Consumer: 2, Stream: 2})
+			require_Equal(t, len(got.Pending), 2)
+			require_Equal(t, got.Pending[2].Sequence, 2)
+			require_Equal(t, got.Pending[2].Timestamp, ts)
+		})
+	}
+}
+
+func TestFileStoreConsumerUpdateConfigIgnoresPriorJournal(t *testing.T) {
+	fcfg := FileStoreConfig{StoreDir: t.TempDir(), SyncAlways: true, Cipher: NoCipher}
+	fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	oldCfg := &ConsumerConfig{AckPolicy: AckExplicit}
+	store, err := fs.ConsumerStore("config-journal", time.Time{}, oldCfg)
+	require_NoError(t, err)
+	o := store.(*consumerFileStore)
+
+	// Write the old configuration's state and journal synchronously so the
+	// journal survives until the configuration update writes a new snapshot.
+	checkFor(t, time.Second, 20*time.Millisecond, func() error {
+		if !o.inFlusher() {
+			return fmt.Errorf("flusher not running")
+		}
+		return nil
+	})
+	o.mu.Lock()
+	qch := o.qch
+	o.qch = nil
+	o.mu.Unlock()
+	close(qch)
+	checkFor(t, time.Second, 20*time.Millisecond, func() error {
+		if o.inFlusher() {
+			return fmt.Errorf("flusher still running")
+		}
+		return nil
+	})
+
+	ts := time.Now().UnixNano()
+	// The redelivery frame below is idempotent under the old configuration. It
+	// becomes destructive only if replayed using MaxDeliver=1.
+	require_NoError(t, o.ForceUpdate(&ConsumerState{
+		Delivered: SequencePair{Consumer: 1, Stream: 1},
+		Pending: map[uint64]*Pending{
+			1: {Sequence: 1, Timestamp: ts},
+		},
+		Redelivered: map[uint64]uint64{1: 1},
+	}))
+	require_NoError(t, o.UpdateDelivered(1, 1, 2, ts))
+	require_NoError(t, o.writeJournalCheckpoint())
+	journal, err := os.ReadFile(consumerJournalFile(o))
+	require_NoError(t, err)
+	snapshot, err := os.ReadFile(o.ifn)
+	require_NoError(t, err)
+
+	newCfg := &ConsumerConfig{AckPolicy: AckExplicit, MaxDeliver: 1}
+	require_NoError(t, o.UpdateConfig(newCfg))
+	// Full snapshots intentionally leave the old journal file in place. Put
+	// the old snapshot back after metadata is durable to construct the exact
+	// crash artifact from a metadata-before-snapshot update; recovery must not
+	// replay those old-rule frames using MaxDeliver=1.
+	unchanged, err := os.ReadFile(consumerJournalFile(o))
+	require_NoError(t, err)
+	if !bytes.Equal(journal, unchanged) {
+		t.Fatal("configuration update unexpectedly rewrote the prior journal")
+	}
+	stateFile := o.ifn
+	require_NoError(t, o.Stop())
+	require_NoError(t, os.WriteFile(stateFile, snapshot, defaultFilePerms))
+
+	store, err = fs.ConsumerStore("config-journal", time.Time{}, newCfg)
+	require_NoError(t, err)
+	defer store.Stop()
+	state, err := store.State()
+	require_NoError(t, err)
+	require_Equal(t, state.Delivered, SequencePair{Consumer: 1, Stream: 1})
+	require_Equal(t, len(state.Pending), 1)
+	require_Equal(t, state.Pending[1].Sequence, uint64(1))
+	require_Equal(t, state.Redelivered[1], uint64(1))
+}
+
+func TestFileStoreConsumerStopWaitsForActiveStateWrite(t *testing.T) {
+	fcfg := FileStoreConfig{StoreDir: t.TempDir(), SyncAlways: true}
+	fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	cfg := &ConsumerConfig{AckPolicy: AckExplicit}
+	store, err := fs.ConsumerStore("stop-wait", time.Time{}, cfg)
+	require_NoError(t, err)
+	o := store.(*consumerFileStore)
+
+	// Hold every disk-I/O slot before scheduling the first checkpoint. The
+	// flusher sets o.writing before it blocks trying to write the state file.
+	for range fs.dios.cap() {
+		fs.dios.acquire()
+	}
+	released := false
+	defer func() {
+		if !released {
+			for range fs.dios.cap() {
+				fs.dios.release()
+			}
+		}
+	}()
+
+	ts := time.Now().UnixNano()
+	require_NoError(t, o.UpdateDelivered(1, 1, 1, ts))
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		o.mu.Lock()
+		writing := o.writing
+		o.mu.Unlock()
+		if !writing {
+			return fmt.Errorf("consumer state write has not started")
+		}
+		return nil
+	})
+
+	// This update is accepted while the first checkpoint owns the state-file
+	// write. Stop must wait for that write and persist this later delivery.
+	require_NoError(t, o.UpdateDelivered(2, 2, 1, ts+1))
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- o.Stop() }()
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop returned before the active write completed: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	for range fs.dios.cap() {
+		fs.dios.release()
+	}
+	released = true
+	require_NoError(t, <-stopDone)
+
+	store, err = fs.ConsumerStore("stop-wait", time.Time{}, cfg)
+	require_NoError(t, err)
+	defer store.Stop()
+	state, err := store.State()
+	require_NoError(t, err)
+	require_Equal(t, state.Delivered, SequencePair{Consumer: 2, Stream: 2})
+	require_Equal(t, len(state.Pending), 2)
+}
+
 func TestFileStoreConsumerDeliveredUpdates(t *testing.T) {
 	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
 		fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
